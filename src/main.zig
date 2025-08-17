@@ -70,8 +70,33 @@ pub fn main() !void {
 
     udp_handler.startReceive(&loop);
 
-    // Run the loop until there are no more completions.
-    try loop.run(.until_done);
+    // Run the loop with periodic cleanup
+    var last_cleanup: i64 = 0;
+    while (true) {
+        // Process one batch of events - use a much shorter timeout for responsiveness
+        loop.tick(1) catch |err| {
+            std.log.err("Loop tick failed: {}", .{err});
+            return err;
+        };
+
+        // Periodic cleanup every 30 seconds
+        const now = std.time.timestamp();
+        if (now - last_cleanup >= 30) {
+            state.cleanupStaleUdpSessions();
+            last_cleanup = now;
+        }
+    }
+
+    // Clean up all UDP sessions first
+    var it = state.udp_sessions.iterator();
+    while (it.next()) |entry| {
+        entry.value_ptr.*.deinit();
+    }
+    state.udp_sessions.clearAndFree();
+
+    // Clean up UDP handler
+    posix.close(state.udp_fd);
+    gpa.destroy(udp_handler);
 }
 
 const ServerState = struct {
@@ -79,16 +104,24 @@ const ServerState = struct {
     udp_sessions: UdpSessionMap,
     udp_fd: posix.socket_t = undefined,
     allocator: mem.Allocator,
+    last_cleanup: i64 = 0,
 
     pub fn remove(self: *ServerState, fd: posix.socket_t) void {
         if (self.connections.fetchRemove(fd)) |pair| {
-            // Close the target fd if it exists, but be careful about the main fd
-            if (pair.value.target_fd) |target| {
+            const conn = pair.value;
+            std.log.info("Removing connection: fd={}, target_fd={?}", .{ fd, conn.target_fd });
+
+            // Mark the connection as invalid to prevent callbacks from using it
+            conn.fd = -1;
+
+            // Close the target fd if it exists
+            if (conn.target_fd) |target| {
                 posix.close(target);
-                pair.value.target_fd = null;
+                conn.target_fd = null;
             }
+
             // Don't close the main fd here - it might already be closed
-            self.allocator.destroy(pair.value);
+            self.allocator.destroy(conn);
         } else {
             std.log.warn("Attempted to remove non-existent connection: fd={}", .{fd});
         }
@@ -97,6 +130,33 @@ const ServerState = struct {
     pub fn removeUdpSession(self: *ServerState, key: UdpSessionKey) void {
         if (self.udp_sessions.fetchRemove(key)) |pair| {
             pair.value.deinit();
+        }
+    }
+
+    pub fn cleanupStaleUdpSessions(self: *ServerState) void {
+        const now = std.time.timestamp();
+        if (now - self.last_cleanup < 60) return; // Only cleanup every minute
+
+        self.last_cleanup = now;
+        const timeout = 300; // 5 minutes timeout
+
+        // Collect keys to remove
+        var keys_to_remove = std.ArrayList(UdpSessionKey).init(self.allocator);
+        defer keys_to_remove.deinit();
+
+        var it = self.udp_sessions.iterator();
+        while (it.next()) |entry| {
+            const session = entry.value_ptr.*;
+            if (now - session.last_activity > timeout) {
+                std.log.info("Removing stale UDP session for {}", .{session.key.target_addr});
+                session.deinit();
+                keys_to_remove.append(session.key) catch continue;
+            }
+        }
+
+        // Remove the collected keys
+        for (keys_to_remove.items) |key| {
+            _ = self.udp_sessions.remove(key);
         }
     }
 };
@@ -179,6 +239,9 @@ const UdpSession = struct {
         crypto.aead.chacha_poly.ChaCha20Poly1305.decrypt(plaintext[0..data_len], data, tag.*, &[_]u8{}, // No additional data
             self.nonce, self.subkey) catch return error.DecryptionFailed;
 
+        // Increment nonce AFTER successful decryption
+        incrementNonce(&self.nonce);
+
         return data_len;
     }
 
@@ -192,6 +255,9 @@ const UdpSession = struct {
 
         crypto.aead.chacha_poly.ChaCha20Poly1305.encrypt(data, tag, plaintext, &[_]u8{}, // No additional data
             self.nonce, self.subkey);
+
+        // Increment nonce
+        incrementNonce(&self.nonce);
 
         return plaintext.len + AEAD_TAG_SIZE;
     }
@@ -259,25 +325,32 @@ const ConnectionState = enum {
 const Connection = struct {
     fd: posix.socket_t,
     target_fd: ?posix.socket_t = null,
-    read_buf: [4096]u8,
-    write_buf: [4096]u8,
-    target_read_buf: [4096]u8,
+    read_buf: [8192]u8,
+    write_buf: [8192 + AEAD_TAG_SIZE]u8,
+    target_read_buf: [8192]u8,
     comp: xev.Completion,
     target_comp: xev.Completion,
+    write_comp: xev.Completion,
+    connect_comp: xev.Completion,
+    close_comp: xev.Completion,
 
     // Shadowsocks state
     state: ConnectionState = .reading_salt,
     master_key: [32]u8,
     salt: [SALT_SIZE]u8 = undefined,
     subkey: [32]u8 = undefined,
-    nonce: [NONCE_SIZE]u8 = std.mem.zeroes([NONCE_SIZE]u8),
-    target_nonce: [NONCE_SIZE]u8 = std.mem.zeroes([NONCE_SIZE]u8),
+    recv_nonce: [NONCE_SIZE]u8 = std.mem.zeroes([NONCE_SIZE]u8), // For decrypting client data
+    send_nonce: [NONCE_SIZE]u8 = std.mem.zeroes([NONCE_SIZE]u8), // For encrypting server responses
     expected_length: u16 = 0,
     bytes_read: usize = 0,
 
     // Write state tracking
     write_data: []const u8 = &[_]u8{},
     write_offset: usize = 0,
+
+    // Connection state management
+    is_closed: bool = false,
+    pending_operations: u32 = 0,
 
     server_state: *ServerState,
 
@@ -290,6 +363,9 @@ const Connection = struct {
             .target_read_buf = undefined,
             .comp = undefined,
             .target_comp = undefined,
+            .write_comp = undefined,
+            .connect_comp = undefined,
+            .close_comp = undefined,
             .write_data = &[_]u8{},
             .write_offset = 0,
             .server_state = server_state,
@@ -312,7 +388,28 @@ const Connection = struct {
         self.server_state.allocator.destroy(self);
     }
 
+    pub fn markClosed(self: *Connection) void {
+        self.is_closed = true;
+    }
+
+    pub fn incrementPending(self: *Connection) void {
+        self.pending_operations += 1;
+    }
+
+    pub fn decrementPending(self: *Connection) void {
+        if (self.pending_operations > 0) {
+            self.pending_operations -= 1;
+        }
+    }
+
     pub fn read(self: *Connection, loop: *xev.Loop) void {
+        if (self.is_closed) {
+            std.log.warn("Attempted to read from closed connection: fd={}", .{self.fd});
+            return;
+        }
+
+        std.log.info("Setting up read completion for fd: {}", .{self.fd});
+        self.incrementPending();
         self.comp = .{
             .op = .{
                 .recv = .{
@@ -327,12 +424,30 @@ const Connection = struct {
     }
 
     pub fn readTarget(self: *Connection, loop: *xev.Loop) void {
-        if (self.target_fd == null) return;
+        if (self.is_closed) {
+            std.log.warn("Attempted to read from target of closed connection: fd={}", .{self.fd});
+            return;
+        }
 
+        if (self.target_fd == null) {
+            std.log.warn("Cannot set up target read: target_fd is null", .{});
+            return;
+        }
+
+        const target_fd = self.target_fd.?;
+        std.log.info("Setting up target read completion for fd: {}", .{target_fd});
+
+        // Add defensive check for valid file descriptor
+        if (target_fd < 0) {
+            std.log.err("Invalid target file descriptor: {}", .{target_fd});
+            return;
+        }
+
+        self.incrementPending();
         self.target_comp = .{
             .op = .{
                 .recv = .{
-                    .fd = self.target_fd.?,
+                    .fd = target_fd,
                     .buffer = .{ .slice = &self.target_read_buf },
                 },
             },
@@ -343,6 +458,11 @@ const Connection = struct {
     }
 
     pub fn write(self: *Connection, loop: *xev.Loop, data: []const u8) void {
+        if (self.is_closed) {
+            std.log.warn("Attempted to write to closed connection: fd={}", .{self.fd});
+            return;
+        }
+
         const copy_len = @min(data.len, self.write_buf.len);
         if (copy_len < data.len) {
             std.log.warn("Message truncated: {} bytes -> {} bytes", .{ data.len, copy_len });
@@ -355,8 +475,15 @@ const Connection = struct {
     }
 
     fn writeInternal(self: *Connection, loop: *xev.Loop) void {
+        if (self.is_closed) {
+            std.log.warn("Attempted to write internally to closed connection: fd={}", .{self.fd});
+            return;
+        }
+
         const remaining = self.write_data[self.write_offset..];
-        self.comp = .{
+        std.log.debug("Sending {}", .{remaining.len});
+        self.incrementPending();
+        self.write_comp = .{
             .op = .{
                 .send = .{
                     .fd = self.fd,
@@ -366,16 +493,16 @@ const Connection = struct {
             .userdata = self,
             .callback = sendCallback,
         };
-        loop.add(&self.comp);
+        loop.add(&self.write_comp);
     }
 
     pub fn close(self: *Connection, loop: *xev.Loop) void {
-        self.comp = .{
+        self.close_comp = .{
             .op = .{ .close = .{ .fd = self.fd } },
             .userdata = self,
             .callback = closeCallback,
         };
-        loop.add(&self.comp);
+        loop.add(&self.close_comp);
     }
 
     fn deriveSubkey(self: *Connection) void {
@@ -385,8 +512,8 @@ const Connection = struct {
         hkdf.expand(&self.subkey, "ss-subkey", prk);
 
         // Reset nonces after deriving new subkey
-        self.nonce = std.mem.zeroes([NONCE_SIZE]u8);
-        self.target_nonce = std.mem.zeroes([NONCE_SIZE]u8);
+        self.recv_nonce = std.mem.zeroes([NONCE_SIZE]u8);
+        self.send_nonce = std.mem.zeroes([NONCE_SIZE]u8);
 
         std.log.info("Derived subkey from salt: {any}", .{self.salt[0..8]});
         std.log.info("Subkey: {any}", .{self.subkey[0..8]});
@@ -400,6 +527,8 @@ const Connection = struct {
 
         const data = ciphertext[0..data_len];
         const tag = ciphertext[data_len..][0..AEAD_TAG_SIZE];
+
+        std.log.debug("nonce - {any}", .{nonce.*});
 
         crypto.aead.chacha_poly.ChaCha20Poly1305.decrypt(plaintext[0..data_len], data, tag.*, &[_]u8{}, // No additional data
             nonce.*, self.subkey) catch return error.DecryptionFailed;
@@ -418,6 +547,8 @@ const Connection = struct {
 
         @memcpy(data, plaintext);
 
+        std.log.debug("nonce - {any}", .{nonce.*});
+
         crypto.aead.chacha_poly.ChaCha20Poly1305.encrypt(data, tag, plaintext, &[_]u8{}, // No additional data
             nonce.*, self.subkey);
 
@@ -433,7 +564,7 @@ const Connection = struct {
         self.state = .connecting_target;
 
         // Use async connect
-        self.comp = .{
+        self.connect_comp = .{
             .op = .{
                 .connect = .{
                     .socket = target_fd,
@@ -443,7 +574,7 @@ const Connection = struct {
             .userdata = self,
             .callback = connectCallback,
         };
-        loop.add(&self.comp);
+        loop.add(&self.connect_comp);
     }
 };
 
@@ -464,13 +595,20 @@ fn udpRecvCallback(
     comp: *xev.Completion,
     result: xev.Result,
 ) xev.CallbackAction {
+    if (ud == null) {
+        std.log.err("UDP recv callback called with null userdata", .{});
+        return .disarm;
+    }
+
     const handler = @as(*UdpHandler, @ptrCast(@alignCast(ud.?)));
     const recv = comp.op.recvfrom;
 
     const read_len = result.recv catch |err| {
-        std.log.err("UDP recv failed: {}", .{err});
-        handler.startReceive(loop);
-        return .disarm;
+        // Don't log errors for normal socket closure
+        if (err != error.BadFileDescriptor) {
+            std.log.err("UDP recv failed: {}", .{err});
+        }
+        return .disarm; // Don't restart receive if socket is closed
     };
 
     if (read_len == 0) {
@@ -513,10 +651,8 @@ fn processUdpPacket(state: *ServerState, loop: *xev.Loop, client_addr: net.Addre
         .recv_buf = undefined,
     };
 
-    // Derive master key
-    var hasher = crypto.hash.sha2.Sha256.init(.{});
-    hasher.update(SHADOWSOCKS_PASSWORD);
-    hasher.final(&temp_session.master_key);
+    // Derive master key using EVP_BytesToKey algorithm (MD5-based)
+    evpBytesToKey(SHADOWSOCKS_PASSWORD, &temp_session.master_key);
 
     // Derive subkey
     temp_session.deriveSubkey(salt);
@@ -542,13 +678,14 @@ fn processUdpPacket(state: *ServerState, loop: *xev.Loop, client_addr: net.Addre
     // Get or create session
     var session = state.udp_sessions.get(session_key);
     if (session == null) {
-        const new_session = UdpSession.init(state, session_key) catch {
-            std.log.err("Failed to create UDP session", .{});
+        const new_session = UdpSession.init(state, session_key) catch |err| {
+            std.log.err("Failed to create UDP session: {}", .{err});
             return;
         };
         new_session.deriveSubkey(salt);
 
-        state.udp_sessions.put(session_key, new_session) catch {
+        state.udp_sessions.put(session_key, new_session) catch |err| {
+            std.log.err("Failed to store UDP session: {}", .{err});
             new_session.deinit();
             return;
         };
@@ -570,19 +707,22 @@ fn processUdpPacket(state: *ServerState, loop: *xev.Loop, client_addr: net.Addre
     const payload = decrypted_buf[addr_header_len..decrypted_len];
 
     // Send to target
-    const send_comp = try state.allocator.create(xev.Completion);
-    send_comp.* = .{
-        .op = .{
-            .sendto = .{
-                .fd = sess.target_fd,
-                .buffer = .{ .slice = payload },
-                .addr = target_addr,
+    const wrapper = try state.allocator.create(UdpSendWrapper);
+    wrapper.* = .{
+        .comp = .{
+            .op = .{
+                .sendto = .{
+                    .fd = sess.target_fd,
+                    .buffer = .{ .slice = payload },
+                    .addr = target_addr,
+                },
             },
+            .userdata = wrapper,
+            .callback = udpSendCallback,
         },
-        .userdata = send_comp,
-        .callback = udpSendCallback,
+        .allocator = state.allocator,
     };
-    loop.add(send_comp);
+    loop.add(&wrapper.comp);
 
     std.log.info("Forwarded UDP packet to {}: {} bytes", .{ target_addr, payload.len });
 }
@@ -593,13 +733,20 @@ fn udpTargetRecvCallback(
     comp: *xev.Completion,
     result: xev.Result,
 ) xev.CallbackAction {
+    if (ud == null) {
+        std.log.err("UDP target recv callback called with null userdata", .{});
+        return .disarm;
+    }
+
     const session = @as(*UdpSession, @ptrCast(@alignCast(ud.?)));
     const recv = comp.op.recv;
 
     const read_len = result.recv catch |err| {
-        std.log.err("UDP target recv failed: {}", .{err});
-        session.startReceive(loop);
-        return .disarm;
+        // Don't log errors for normal socket closure
+        if (err != error.BadFileDescriptor) {
+            std.log.err("UDP target recv failed: {}", .{err});
+        }
+        return .disarm; // Don't restart receive if socket is closed
     };
 
     if (read_len == 0) {
@@ -636,29 +783,37 @@ fn udpTargetRecvCallback(
     };
 
     // Send back to client
-    const send_comp = session.state.allocator.create(xev.Completion) catch {
+    const wrapper = session.state.allocator.create(UdpSendWrapper) catch {
         std.log.err("Failed to allocate send completion", .{});
         session.startReceive(loop);
         return .disarm;
     };
 
-    send_comp.* = .{
-        .op = .{
-            .sendto = .{
-                .fd = session.state.udp_fd,
-                .buffer = .{ .slice = encrypted_buf[0..encrypted_len] },
-                .addr = session.key.client_addr,
+    wrapper.* = .{
+        .comp = .{
+            .op = .{
+                .sendto = .{
+                    .fd = session.state.udp_fd,
+                    .buffer = .{ .slice = encrypted_buf[0..encrypted_len] },
+                    .addr = session.key.client_addr,
+                },
             },
+            .userdata = wrapper,
+            .callback = udpSendCallback,
         },
-        .userdata = send_comp,
-        .callback = udpSendCallback,
+        .allocator = session.state.allocator,
     };
-    loop.add(send_comp);
+    loop.add(&wrapper.comp);
 
     std.log.info("Sent UDP response to client: {} bytes", .{encrypted_len});
     session.startReceive(loop);
     return .disarm;
 }
+
+const UdpSendWrapper = struct {
+    comp: xev.Completion,
+    allocator: mem.Allocator,
+};
 
 fn udpSendCallback(
     ud: ?*anyopaque,
@@ -666,15 +821,19 @@ fn udpSendCallback(
     _: *xev.Completion,
     result: xev.Result,
 ) xev.CallbackAction {
-    const send_comp = @as(*xev.Completion, @ptrCast(@alignCast(ud.?)));
+    if (ud == null) {
+        std.log.err("UDP send callback called with null userdata", .{});
+        return .disarm;
+    }
+
+    const wrapper = @as(*UdpSendWrapper, @ptrCast(@alignCast(ud.?)));
 
     _ = result.send catch |err| {
         std.log.err("UDP send failed: {}", .{err});
     };
 
-    // Free the completion
-    const allocator = std.heap.page_allocator; // This is a hack - in real code you'd pass the allocator
-    allocator.destroy(send_comp);
+    // Free the wrapper
+    wrapper.allocator.destroy(wrapper);
 
     return .disarm;
 }
@@ -806,26 +965,33 @@ fn recvCallback(
     const recv = comp.op.recv;
     const conn = @as(*Connection, @ptrCast(@alignCast(ud.?)));
 
+    conn.decrementPending(); // Mark this operation as complete
+
+    if (conn.is_closed) return .disarm;
+
     const read_len = result.recv catch |err| {
-        if (err == error.EOF) {
-            std.log.info("Client closed connection (EOF): fd={}", .{conn.fd});
-            // Don't try to close again, just clean up the connection state
-            conn.server_state.remove(conn.fd);
-            return .disarm;
+        switch (err) {
+            error.EOF, error.ConnectionResetByPeer, error.BrokenPipe => {
+                std.log.info("Client connection closed ({}): fd={}", .{ err, conn.fd });
+                conn.markClosed();
+                return .disarm;
+            },
+            else => {
+                std.log.err("Recv failed: {}", .{err});
+                conn.close(loop);
+                return .disarm;
+            },
         }
-        std.log.err("Recv failed: {}", .{err});
-        conn.close(loop);
-        return .disarm;
     };
 
     if (read_len == 0) {
         std.log.info("Client closed connection: fd={}", .{conn.fd});
-        conn.server_state.remove(conn.fd);
+        conn.markClosed();
         return .disarm;
     }
 
     const data = recv.buffer.slice[0..read_len];
-    std.log.info("Received {} bytes from client in state: {}", .{ read_len, conn.state });
+    std.log.info("Received {} bytes from client in state: {} (fd={})", .{ read_len, conn.state, conn.fd });
 
     switch (conn.state) {
         .reading_salt => {
@@ -834,10 +1000,17 @@ fn recvCallback(
 
             std.log.info("Salt progress: {}/{} bytes, copying {} bytes", .{ conn.bytes_read, SALT_SIZE, copy_len });
 
+            // Debug: log the first few bytes of received data
+            if (conn.bytes_read == 0) {
+                const debug_len = @min(data.len, 16);
+                std.log.info("First {} bytes of data: {any}", .{ debug_len, data[0..debug_len] });
+            }
+
             @memcpy(conn.salt[conn.bytes_read .. conn.bytes_read + copy_len], data[0..copy_len]);
             conn.bytes_read += copy_len;
 
             if (conn.bytes_read >= SALT_SIZE) {
+                std.log.info("Complete salt received: {any}", .{conn.salt});
                 conn.deriveSubkey();
                 conn.bytes_read = 0;
                 conn.state = .reading_length;
@@ -855,8 +1028,10 @@ fn recvCallback(
                 std.log.info("Need {} more bytes for salt, continuing to read...", .{SALT_SIZE - conn.bytes_read});
             }
 
-            // Always continue reading
-            conn.read(loop);
+            // Only schedule new read if connection is still valid
+            if (!conn.is_closed) {
+                conn.read(loop);
+            }
         },
 
         .reading_length => {
@@ -876,7 +1051,9 @@ fn recvCallback(
 
         else => {
             std.log.warn("Unexpected state: {}", .{conn.state});
-            conn.read(loop);
+            if (!conn.is_closed) {
+                conn.read(loop);
+            }
         },
     }
 
@@ -886,7 +1063,7 @@ fn recvCallback(
 fn processLengthData(conn: *Connection, loop: *xev.Loop, data: []const u8) xev.CallbackAction {
     if (data.len >= 2 + AEAD_TAG_SIZE) {
         var length_buf: [2]u8 = undefined;
-        const decrypted_len = conn.decrypt(data[0 .. 2 + AEAD_TAG_SIZE], &length_buf, &conn.nonce) catch {
+        const decrypted_len = conn.decrypt(data[0 .. 2 + AEAD_TAG_SIZE], &length_buf, &conn.recv_nonce) catch {
             std.log.err("Failed to decrypt length", .{});
             conn.close(loop);
             return .disarm;
@@ -908,7 +1085,11 @@ fn processLengthData(conn: *Connection, loop: *xev.Loop, data: []const u8) xev.C
             return processPayloadData(conn, loop, data[consumed..]);
         }
     }
-    conn.read(loop);
+
+    // Only schedule new read if connection is still valid
+    if (!conn.is_closed) {
+        conn.read(loop);
+    }
     return .disarm;
 }
 
@@ -916,7 +1097,7 @@ fn processPayloadData(conn: *Connection, loop: *xev.Loop, data: []const u8) xev.
     const expected_encrypted_len = conn.expected_length + AEAD_TAG_SIZE;
     if (data.len >= expected_encrypted_len) {
         var payload_buf: [4096]u8 = undefined;
-        const decrypted_len = conn.decrypt(data[0..expected_encrypted_len], &payload_buf, &conn.nonce) catch {
+        const decrypted_len = conn.decrypt(data[0..expected_encrypted_len], &payload_buf, &conn.recv_nonce) catch {
             std.log.err("Failed to decrypt payload", .{});
             conn.close(loop);
             return .disarm;
@@ -953,7 +1134,7 @@ fn processPayloadData(conn: *Connection, loop: *xev.Loop, data: []const u8) xev.
             if (remaining.len >= 2 + AEAD_TAG_SIZE) {
                 // This might be a length chunk for more data
                 var length_buf: [2]u8 = undefined;
-                const length_decrypted = conn.decrypt(remaining[0 .. 2 + AEAD_TAG_SIZE], &length_buf, &conn.nonce) catch {
+                const length_decrypted = conn.decrypt(remaining[0 .. 2 + AEAD_TAG_SIZE], &length_buf, &conn.recv_nonce) catch {
                     std.log.warn("Could not decrypt additional length chunk, ignoring", .{});
                     conn.connectToTarget(loop, address) catch {
                         conn.close(loop);
@@ -972,7 +1153,7 @@ fn processPayloadData(conn: *Connection, loop: *xev.Loop, data: []const u8) xev.
                     if (remaining.len >= next_start + next_encrypted_len) {
                         // We have the complete next payload
                         var next_payload_buf: [4096]u8 = undefined;
-                        const next_decrypted_len = conn.decrypt(remaining[next_start .. next_start + next_encrypted_len], &next_payload_buf, &conn.nonce) catch {
+                        const next_decrypted_len = conn.decrypt(remaining[next_start .. next_start + next_encrypted_len], &next_payload_buf, &conn.recv_nonce) catch {
                             std.log.warn("Could not decrypt additional payload chunk", .{});
                             conn.connectToTarget(loop, address) catch {
                                 conn.close(loop);
@@ -1000,41 +1181,104 @@ fn processPayloadData(conn: *Connection, loop: *xev.Loop, data: []const u8) xev.
         };
         return .disarm;
     }
-    conn.read(loop);
+
+    // Only schedule new read if connection is still valid
+    if (!conn.is_closed) {
+        conn.read(loop);
+    }
     return .disarm;
 }
 
 fn processRelayData(conn: *Connection, loop: *xev.Loop, data: []const u8) xev.CallbackAction {
     if (conn.target_fd) |target_fd| {
-        var decrypted_buf: [4096]u8 = undefined;
-        const decrypted_len = conn.decrypt(data, &decrypted_buf, &conn.nonce) catch {
-            std.log.err("Failed to decrypt relay data", .{});
-            conn.close(loop);
-            return .disarm;
-        };
+        // Handle potentially multiple encrypted chunks in the data
+        var offset: usize = 0;
+        var total_decrypted: usize = 0;
 
-        std.log.info("Decrypted {} bytes, forwarding to target", .{decrypted_len});
+        while (offset < data.len) {
+            // Need at least 2 bytes for length + tag
+            if (offset + 2 + AEAD_TAG_SIZE > data.len) {
+                std.log.warn("Incomplete encrypted chunk at offset {}, remaining {} bytes", .{ offset, data.len - offset });
+                break;
+            }
 
-        // Copy to target_read_buf for persistent storage during async send
-        const copy_len = @min(decrypted_len, conn.target_read_buf.len);
-        @memcpy(conn.target_read_buf[0..copy_len], decrypted_buf[0..copy_len]);
+            // Try to decrypt length first
+            var length_buf: [2]u8 = undefined;
+            const length_decrypted = conn.decrypt(data[offset .. offset + 2 + AEAD_TAG_SIZE], &length_buf, &conn.recv_nonce) catch |err| {
+                std.log.err("Failed to decrypt length in relay data at offset {}: {}", .{ offset, err });
+                conn.close(loop);
+                return .disarm;
+            };
 
-        // Forward to target (async send)
-        conn.target_comp = .{
-            .op = .{
-                .send = .{
-                    .fd = target_fd,
-                    .buffer = .{ .slice = conn.target_read_buf[0..copy_len] },
+            if (length_decrypted != 2) {
+                std.log.err("Invalid length field in relay: got {} bytes, expected 2", .{length_decrypted});
+                conn.close(loop);
+                return .disarm;
+            }
+
+            const payload_len = std.mem.readInt(u16, &length_buf, .big);
+            const encrypted_payload_len = payload_len + AEAD_TAG_SIZE;
+            const length_chunk_len = 2 + AEAD_TAG_SIZE;
+
+            // Check if we have the complete payload
+            if (offset + length_chunk_len + encrypted_payload_len > data.len) {
+                std.log.warn("Incomplete payload chunk, need {} more bytes", .{offset + length_chunk_len + encrypted_payload_len - data.len});
+                break;
+            }
+
+            // Decrypt the payload
+            var payload_buf: [4096]u8 = undefined;
+            const payload_start = offset + length_chunk_len;
+            const payload_decrypted = conn.decrypt(data[payload_start .. payload_start + encrypted_payload_len], &payload_buf, &conn.recv_nonce) catch |err| {
+                std.log.err("Failed to decrypt payload in relay data: {}", .{err});
+                conn.close(loop);
+                return .disarm;
+            };
+
+            std.log.debug("Request: {}", .{payload_decrypted});
+
+            // Copy to target buffer (accumulate if multiple chunks)
+            if (total_decrypted + payload_decrypted <= conn.target_read_buf.len) {
+                @memcpy(conn.target_read_buf[total_decrypted .. total_decrypted + payload_decrypted], payload_buf[0..payload_decrypted]);
+                total_decrypted += payload_decrypted;
+            } else {
+                std.log.warn("Target buffer overflow, truncating data", .{});
+                break;
+            }
+
+            // Move to next chunk
+            offset += length_chunk_len + encrypted_payload_len;
+        }
+
+        if (total_decrypted > 0) {
+            std.log.info("Decrypted {} bytes total, forwarding to target", .{total_decrypted});
+
+            // Forward to target (async send)
+            conn.target_comp = .{
+                .op = .{
+                    .send = .{
+                        .fd = target_fd,
+                        .buffer = .{ .slice = conn.target_read_buf[0..total_decrypted] },
+                    },
                 },
-            },
-            .userdata = conn,
-            .callback = targetSendCallback,
-        };
-        loop.add(&conn.target_comp);
+                .userdata = conn,
+                .callback = targetSendCallback,
+            };
+            loop.add(&conn.target_comp);
+        } else {
+            // No complete chunks, continue reading
+            if (!conn.is_closed) {
+                conn.read(loop);
+            }
+        }
 
         return .disarm;
     }
-    conn.read(loop);
+
+    // Only schedule new read if connection is still valid
+    if (!conn.is_closed) {
+        conn.read(loop);
+    }
     return .disarm;
 }
 
@@ -1047,39 +1291,66 @@ fn targetRecvCallback(
     const recv = comp.op.recv;
     const conn = @as(*Connection, @ptrCast(@alignCast(ud.?)));
 
+    conn.decrementPending(); // Mark this operation as complete
+
+    if (conn.is_closed) return .disarm;
+
     const read_len = result.recv catch |err| {
-        if (err == error.EOF) {
-            std.log.info("Target closed connection (EOF)", .{});
-            conn.server_state.remove(conn.fd);
-            return .disarm;
+        switch (err) {
+            error.EOF, error.ConnectionResetByPeer, error.BrokenPipe => {
+                std.log.info("Target connection closed ({})", .{err});
+                conn.markClosed();
+                return .disarm;
+            },
+            else => {
+                std.log.err("Target recv failed: {}", .{err});
+                conn.close(loop);
+                return .disarm;
+            },
         }
-        std.log.err("Target recv failed: {}", .{err});
-        conn.close(loop);
-        return .disarm;
     };
 
     if (read_len == 0) {
         std.log.info("Target closed connection", .{});
-        conn.server_state.remove(conn.fd);
+        conn.markClosed();
         return .disarm;
     }
 
     const data = recv.buffer.slice[0..read_len];
     std.log.info("Received {} bytes from target, encrypting and sending to client", .{read_len});
 
-    // Encrypt and send back to client
-    var encrypted_buf: [4096 + AEAD_TAG_SIZE]u8 = undefined;
-    const encrypted_len = conn.encrypt(data, &encrypted_buf, &conn.target_nonce) catch {
+    // For Shadowsocks AEAD, we need to send length + encrypted payload
+    var response_buf: [4096 + 2 + AEAD_TAG_SIZE * 2]u8 = undefined;
+    var response_len: usize = 0;
+
+    // First, encrypt the length
+    const data_len_bytes = std.mem.toBytes(@as(u16, @intCast(data.len)));
+    std.log.info("Encrypting length with send_nonce: {any}", .{conn.send_nonce[0..4]});
+    const length_encrypted_len = conn.encrypt(&data_len_bytes, response_buf[response_len..], &conn.send_nonce) catch {
+        std.log.err("Failed to encrypt length for target data", .{});
+        conn.close(loop);
+        return .disarm;
+    };
+    response_len += length_encrypted_len;
+
+    // Then, encrypt the actual data
+    std.log.info("Encrypting data with send_nonce: {any}", .{conn.send_nonce[0..4]});
+    const data_encrypted_len = conn.encrypt(data, response_buf[response_len..], &conn.send_nonce) catch {
         std.log.err("Failed to encrypt target data", .{});
         conn.close(loop);
         return .disarm;
     };
+    response_len += data_encrypted_len;
 
-    std.log.info("Encrypted {} bytes, sending to client", .{encrypted_len});
-    conn.write(loop, encrypted_buf[0..encrypted_len]);
+    std.log.info("Encrypted {} bytes total (length + data), sending to client", .{response_len});
+    if (!conn.is_closed) {
+        conn.write(loop, response_buf[0..response_len]);
+    }
 
     // Continue reading from target
-    conn.readTarget(loop);
+    if (!conn.is_closed) {
+        conn.readTarget(loop);
+    }
 
     return .disarm;
 }
@@ -1092,16 +1363,31 @@ fn targetSendCallback(
 ) xev.CallbackAction {
     const conn = @as(*Connection, @ptrCast(@alignCast(ud.?)));
 
+    conn.decrementPending(); // Mark this operation as complete
+
+    if (conn.is_closed) return .disarm;
+
     const sent_len = result.send catch |err| {
-        std.log.err("Target send failed: {}", .{err});
-        conn.close(loop);
-        return .disarm;
+        switch (err) {
+            error.ConnectionResetByPeer, error.BrokenPipe => {
+                std.log.info("Target send failed due to connection reset", .{});
+                conn.markClosed();
+                return .disarm;
+            },
+            else => {
+                std.log.err("Target send failed: {}", .{err});
+                conn.close(loop);
+                return .disarm;
+            },
+        }
     };
 
     std.log.info("Sent {} bytes to target", .{sent_len});
 
     // Continue reading from client
-    conn.read(loop);
+    if (!conn.is_closed) {
+        conn.read(loop);
+    }
     return .disarm;
 }
 
@@ -1113,22 +1399,41 @@ fn sendCallback(
 ) xev.CallbackAction {
     const conn = @as(*Connection, @ptrCast(@alignCast(ud.?)));
 
+    conn.decrementPending(); // Mark this operation as complete
+
+    if (conn.is_closed) return .disarm;
+
     const send_len = result.send catch |err| {
-        std.log.err("Send failed: {}", .{err});
-        conn.close(loop);
-        return .disarm;
+        switch (err) {
+            error.ConnectionResetByPeer, error.BrokenPipe => {
+                std.log.info("Send failed due to connection reset: fd={}", .{conn.fd});
+                conn.markClosed();
+                return .disarm;
+            },
+            else => {
+                std.log.err("Send failed: {}", .{err});
+                conn.close(loop);
+                return .disarm;
+            },
+        }
     };
+
+    std.log.info("Send callback: sent {} bytes, offset: {}, total: {}", .{ send_len, conn.write_offset, conn.write_data.len });
 
     conn.write_offset += send_len;
 
     if (conn.write_offset >= conn.write_data.len) {
-        // Write complete, continue with normal operation
-        if (conn.state == .relaying) {
+        // Write complete, continue reading from client for more data
+        std.log.info("Write complete, continuing to read from client", .{});
+        if (!conn.is_closed and conn.state == .relaying) {
             conn.read(loop);
         }
         return .disarm;
     } else {
-        conn.writeInternal(loop);
+        std.log.info("Write incomplete, continuing with remaining data", .{});
+        if (!conn.is_closed) {
+            conn.writeInternal(loop);
+        }
         return .disarm;
     }
 }
