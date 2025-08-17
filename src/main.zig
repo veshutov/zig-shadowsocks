@@ -28,6 +28,7 @@ pub fn main() !void {
         .connections = ConnMap.init(gpa),
         .allocator = gpa,
     };
+
     // Accept
     var c_accept: xev.Completion = .{
         .op = .{ .accept = .{ .socket = ln } },
@@ -45,8 +46,11 @@ const ServerState = struct {
     allocator: mem.Allocator,
 
     pub fn remove(self: *ServerState, fd: posix.socket_t) void {
-        var pair = self.connections.fetchRemove(fd).?;
-        pair.value.deinit();
+        if (self.connections.fetchRemove(fd)) |pair| {
+            pair.value.deinit();
+        } else {
+            std.log.warn("Attempted to remove non-existent connection: fd={}", .{fd});
+        }
     }
 };
 
@@ -54,16 +58,27 @@ const ConnMap = std.AutoHashMap(posix.socket_t, *Connection);
 
 const Connection = struct {
     fd: posix.socket_t,
-    buf: [512]u8,
+    read_buf: [4096]u8,
+    write_buf: [4096]u8,
     comp: xev.Completion,
-    write_len: usize = 0,
+
+    // Write state tracking
+    write_data: []const u8 = &[_]u8{},
+    write_offset: usize = 0,
 
     server_state: *ServerState,
 
-    pub fn init(server_state: *ServerState, new_fd: posix.socket_t) *Connection {
-        var conn = server_state.allocator.create(Connection) catch unreachable;
-        conn.fd = new_fd;
-        conn.server_state = server_state;
+    pub fn init(server_state: *ServerState, new_fd: posix.socket_t) !*Connection {
+        const conn = try server_state.allocator.create(Connection);
+        conn.* = Connection{
+            .fd = new_fd,
+            .read_buf = undefined,
+            .write_buf = undefined,
+            .comp = undefined,
+            .write_data = &[_]u8{},
+            .write_offset = 0,
+            .server_state = server_state,
+        };
         return conn;
     }
 
@@ -71,19 +86,12 @@ const Connection = struct {
         self.server_state.allocator.destroy(self);
     }
 
-    pub fn read_buf(self: *Connection) []u8 {
-        return self.buf[0..256];
-    }
-    pub fn write_buf(self: *Connection) []u8 {
-        return self.buf[256..512];
-    }
-
     pub fn read(self: *Connection, loop: *xev.Loop) void {
         self.comp = .{
             .op = .{
                 .recv = .{
                     .fd = self.fd,
-                    .buffer = .{ .slice = self.read_buf() },
+                    .buffer = .{ .slice = &self.read_buf },
                 },
             },
             .userdata = self,
@@ -92,12 +100,25 @@ const Connection = struct {
         loop.add(&self.comp);
     }
 
-    pub fn write(self: *Connection, loop: *xev.Loop, buf: []u8) void {
+    pub fn write(self: *Connection, loop: *xev.Loop, data: []const u8) void {
+        const copy_len = @min(data.len, self.write_buf.len);
+        if (copy_len < data.len) {
+            std.log.warn("Message truncated: {} bytes -> {} bytes", .{ data.len, copy_len });
+        }
+        @memcpy(self.write_buf[0..copy_len], data[0..copy_len]);
+
+        self.write_data = self.write_buf[0..copy_len];
+        self.write_offset = 0;
+        self.writeInternal(loop);
+    }
+
+    fn writeInternal(self: *Connection, loop: *xev.Loop) void {
+        const remaining = self.write_data[self.write_offset..];
         self.comp = .{
             .op = .{
                 .send = .{
                     .fd = self.fd,
-                    .buffer = .{ .slice = buf },
+                    .buffer = .{ .slice = remaining },
                 },
             },
             .userdata = self,
@@ -115,20 +136,33 @@ const Connection = struct {
         loop.add(&self.comp);
     }
 };
-
 fn acceptCallback(
     ud: ?*anyopaque,
     loop: *xev.Loop,
-    comp: *xev.Completion,
+    _: *xev.Completion,
     result: xev.Result,
 ) xev.CallbackAction {
-    std.log.info("Completion: {}, result: {any}", .{ comp.flags.state, result });
+    const new_fd = result.accept catch |err| {
+        std.log.err("Accept failed: {}", .{err});
+        return .rearm;
+    };
 
-    const new_fd = result.accept catch unreachable;
     var state = @as(*ServerState, @ptrCast(@alignCast(ud.?)));
-    const new_conn = Connection.init(state, new_fd);
+
+    const new_conn = Connection.init(state, new_fd) catch |err| {
+        posix.close(new_fd);
+        std.log.err("Failed to create connection: {}", .{err});
+        return .rearm;
+    };
+
+    state.connections.put(new_fd, new_conn) catch |err| {
+        new_conn.deinit();
+        std.log.err("Failed to store connection: {}", .{err});
+        return .rearm;
+    };
+
+    std.log.info("New connection accepted: fd={}", .{new_fd});
     new_conn.read(loop);
-    state.connections.put(new_fd, new_conn) catch unreachable;
     return .rearm;
 }
 
@@ -138,18 +172,28 @@ fn recvCallback(
     comp: *xev.Completion,
     result: xev.Result,
 ) xev.CallbackAction {
-    std.log.info("Completion: {}, result: {any}", .{ comp.flags.state, result });
-
     const recv = comp.op.recv;
     const conn = @as(*Connection, @ptrCast(@alignCast(ud.?)));
-    const read_len = result.recv catch {
+
+    const read_len = result.recv catch |err| {
+        std.log.err("Recv failed: {}", .{err});
         conn.close(loop);
         return .disarm;
     };
+
+    if (read_len == 0) {
+        // Client closed connection
+        std.log.info("Client closed connection: fd={}", .{conn.fd});
+        conn.close(loop);
+        return .disarm;
+    }
+
     std.log.info(
-        "Recv from {} ({} bytes): {s}",
-        .{ recv.fd, read_len, recv.buffer.slice[0..read_len] },
+        "Recv from {} ({} bytes)",
+        .{ recv.fd, read_len },
     );
+
+    // Echo the received data back
     conn.write(loop, recv.buffer.slice[0..read_len]);
     return .disarm;
 }
@@ -157,29 +201,32 @@ fn recvCallback(
 fn sendCallback(
     ud: ?*anyopaque,
     loop: *xev.Loop,
-    comp: *xev.Completion,
+    _: *xev.Completion,
     result: xev.Result,
 ) xev.CallbackAction {
-    std.log.info("Completion: {}, result: {any}", .{ comp.flags.state, result });
-
-    const send = comp.op.send;
     const conn = @as(*Connection, @ptrCast(@alignCast(ud.?)));
-    const send_len = result.send catch {
+
+    const send_len = result.send catch |err| {
+        std.log.err("Send failed: {}", .{err});
         conn.close(loop);
         return .disarm;
     };
-    std.log.info(
-        "Send   to {} ({} bytes): {s}",
-        .{ send.fd, send_len, send.buffer.slice[0..send_len] },
-    );
 
-    conn.write_len += send_len;
-    if (conn.write_len >= send.buffer.slice.len) {
+    std.log.info("Send to {} ({} bytes)", .{ conn.fd, send_len });
+
+    conn.write_offset += send_len;
+
+    if (conn.write_offset >= conn.write_data.len) {
+        // Complete write - all data has been sent
+        std.log.info("Write complete for fd={}, starting read", .{conn.fd});
         conn.read(loop);
-        conn.write_len = 0;
+        return .disarm;
+    } else {
+        // Partial write - continue with remaining data
+        std.log.info("Partial write for fd={}: sent {}/{} bytes, continuing...", .{ conn.fd, conn.write_offset, conn.write_data.len });
+        conn.writeInternal(loop);
         return .disarm;
     }
-    return .rearm;
 }
 
 fn closeCallback(
@@ -188,8 +235,13 @@ fn closeCallback(
     comp: *xev.Completion,
     result: xev.Result,
 ) xev.CallbackAction {
-    std.log.info("Completion: {}, result: {any}", .{ comp.flags.state, result });
     const conn = @as(*Connection, @ptrCast(@alignCast(ud.?)));
+
+    _ = result.close catch |err| {
+        std.log.err("Close failed: {}", .{err});
+    };
+
+    std.log.info("Connection closed: fd={}", .{conn.fd});
     conn.server_state.remove(comp.op.close.fd);
     return .disarm;
 }
