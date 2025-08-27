@@ -36,6 +36,16 @@ pub const Encryptor = struct {
         return data_len;
     }
 
+    pub fn decryptLength(self: *Encryptor, ciphertext: []const u8, plaintext: []u8) !DecryptResult {
+        const payload_length_data = ciphertext[0 .. PAYLOAD_LENGTH_SIZE + TAG_SIZE];
+        _ = try self.decrypt(payload_length_data, plaintext);
+
+        return .{
+            .ciphertext_read = PAYLOAD_LENGTH_SIZE + TAG_SIZE,
+            .plaintext_written = PAYLOAD_LENGTH_SIZE,
+        };
+    }
+
     pub fn decryptChunk(self: *Encryptor, ciphertext: []const u8, plaintext: []u8) !DecryptResult {
         const payload_length_data = ciphertext[0 .. PAYLOAD_LENGTH_SIZE + TAG_SIZE];
         var payload_length_buf: [PAYLOAD_LENGTH_SIZE]u8 = undefined;
