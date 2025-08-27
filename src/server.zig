@@ -51,7 +51,7 @@ pub const TcpConnection = struct {
 
     client_read_closed: bool = false,
     client_socket_closed: bool = false,
-    client_writes: usize = 0,
+    client_writes: u64 = 0,
     client_address: net.Address,
     client_socket: posix.socket_t,
     client_stream_state: TcpClientStreamState = TcpClientStreamState.reading_salt,
@@ -65,7 +65,7 @@ pub const TcpConnection = struct {
     target_read_completion: ?*TargetReadData = null,
 
     target_read_closed: bool = false,
-    target_writes: usize = 0,
+    target_writes: u64 = 0,
     target_address: net.Address = undefined,
     target_socket: ?posix.socket_t = null,
     server_stream_state: TcpServerStreamState = TcpServerStreamState.writing_salt,
@@ -203,7 +203,6 @@ pub const TcpConnection = struct {
             return false;
         }
         const target_stream = try net.tcpConnectToAddress(self.target_address);
-        errdefer target_stream.close();
         self.target_socket = target_stream.handle;
         return true;
     }

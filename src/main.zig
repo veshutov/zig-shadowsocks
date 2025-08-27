@@ -165,7 +165,7 @@ fn tcpClientReadCallback(
     // std.debug.print("TCP client read text {s}\n", .{tcp_target_write_data.plaintext_buf[0..plaintext_len]});
 
     const connected = connection.connectToTarget() catch |e| {
-        std.debug.print("TCP could not connect to target {}\n", .{e});
+        std.debug.print("TCP could not connect to target {} {} {}\n", .{ connection.target_address, connection.target_address2, e });
         srv.removeConnection(socket, loop);
         allocator.destroy(data);
         allocator.destroy(tcp_target_write_data);
