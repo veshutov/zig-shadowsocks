@@ -119,7 +119,7 @@ pub const TcpConnection = struct {
                         const remaining_len = ciphertext_len - ciphertext_idx;
                         @memcpy(self.ciphertext_buf[0..remaining_len], self.ciphertext_buf[ciphertext_idx..ciphertext_len]);
                         self.ciphertext_remaining_len = remaining_len;
-                        std.debug.print("PARTIAL CHUNK", .{});
+                        std.debug.print("PARTIAL CHUNK before length\n", .{});
                         break :blk 0;
                     }
                     const payload_length_data = self.ciphertext_buf[ciphertext_idx .. ciphertext_idx + crypt.PAYLOAD_LENGTH_SIZE + crypt.TAG_SIZE];
@@ -135,7 +135,9 @@ pub const TcpConnection = struct {
                         plaintext_len += payload_length;
                         break :blk payload_length;
                     } else {
-                        std.debug.print("PARTIAL CHUNK", .{});
+                        std.debug.print("PARTIAL CHUNK after length {} {}\n", .{ciphertext_len, ciphertext_idx + payload_length + crypt.TAG_SIZE});
+                        
+                        self.decryptor.decrementNonce();
                         ciphertext_idx -= crypt.PAYLOAD_LENGTH_SIZE + crypt.TAG_SIZE;
                         const remaining_len = ciphertext_len - ciphertext_idx;
 

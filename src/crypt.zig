@@ -83,6 +83,21 @@ pub const Encryptor = struct {
             if (carry == 0) break;
         }
     }
+
+    pub fn decrementNonce(self: *Encryptor) void {
+        var borrow: i16 = 1;
+        for (0..self.nonce.len) |i| {
+            const temp: i16 = @as(i16, self.nonce[i]) - borrow;
+            if (temp < 0) {
+                self.nonce[i] = @intCast(temp + 256);
+                borrow = 1;
+            } else {
+                self.nonce[i] = @intCast(temp);
+                borrow = 0;
+                break;
+            }
+        }
+    }
 };
 
 fn generateSessionSubkey(salt: []const u8, subkey: []u8) void {
