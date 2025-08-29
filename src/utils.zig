@@ -28,11 +28,16 @@ pub fn parseAddress(payload: []const u8) !net.Address {
             defer allocator.free(domain_str);
 
             const address_list = std.net.getAddressList(allocator, domain_str, port) catch {
-                std.log.err("Failed to resolve domain: {s}", .{domain});
+                std.log.err("TCP failed to resolve domain: {s}", .{domain});
                 return error.DomainResolutionFailed;
             };
             defer address_list.deinit();
 
+            for (address_list.addrs) |addr| {
+                if (addr.any.family == std.posix.AF.INET) {
+                    return addr;
+                }
+            }
             if (address_list.addrs.len > 0) {
                 const resolved_addr = address_list.addrs[0];
                 return resolved_addr;
