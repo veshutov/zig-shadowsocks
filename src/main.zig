@@ -9,7 +9,10 @@ const server = @import("server.zig");
 const Server = server.Server;
 const TcpConnection = server.TcpConnection;
 const TargetReadData = server.TargetReadData;
+const TargetWriteData = server.TargetWriteData;
 const ClientReadData = server.ClientReadData;
+const ClientWriteData = server.ClientWriteData;
+const ClientWriteQueue = server.ClientWriteQueue;
 const utils = @import("utils.zig");
 
 pub fn main() !void {
@@ -48,33 +51,33 @@ fn tcpAcceptCallback(
     const srv = @as(*Server, @ptrCast(@alignCast(ud.?)));
     const allocator = srv.allocator;
 
-    const socket = result.accept catch |e| {
+    const client_socket = result.accept catch |e| {
         std.log.err("TCP accept client failed: {}", .{e});
         return .disarm;
     };
     const client_address = net.Address.initPosix(@alignCast(&comp.op.accept.addr));
-    std.debug.print("TCP {} {} client connected, active:{}\n", .{ client_address, socket, loop.active });
+    std.debug.print("TCP client connected {}, active callbacks: {}, connections: {}\n", .{ client_address, loop.active, srv.tcp_connections.count() });
 
     const connection = allocator.create(TcpConnection) catch |e| {
-        std.debug.print("Could not allocate TCP connection {}\n", .{e});
+        std.debug.print("TCP could not allocate  connection {}\n", .{e});
         return .disarm;
     };
     connection.* = TcpConnection{
         .server = srv,
-        .client_socket = socket,
+        .client_socket = client_socket,
         .client_address = client_address,
     };
 
     srv.addConnection(connection) catch |e| {
-        std.debug.print("Could not add TCP connection {}\n", .{e});
-        posix.close(socket);
+        std.debug.print("TCP could not add connection {}\n", .{e});
+        posix.close(client_socket);
         allocator.destroy(connection);
         return .disarm;
     };
 
     const tcp_client_read_completion = allocator.create(ClientReadData) catch |e| {
-        std.debug.print("Could not allocate TCP client read completion {}\n", .{e});
-        srv.removeConnection(socket, loop);
+        std.debug.print("TCP could not allocate client read completion {}\n", .{e});
+        srv.removeConnection(client_socket, loop);
         return .disarm;
     };
     tcp_client_read_completion.* = ClientReadData{
@@ -83,7 +86,7 @@ fn tcpAcceptCallback(
         .completion = .{
             .op = .{
                 .read = .{
-                    .fd = socket,
+                    .fd = client_socket,
                     .buffer = .{
                         .slice = &connection.ciphertext_read_buf,
                     },
@@ -119,45 +122,50 @@ fn tcpClientReadCallback(
     const data = @as(*ClientReadData, @ptrCast(@alignCast(ud.?)));
     const srv = data.server;
     const read = comp.op.read;
-    const socket = read.fd;
+    const client_socket = read.fd;
     const allocator = srv.allocator;
-    const connection_opt = srv.tcp_connections.get(socket);
+    const connection_opt = srv.tcp_connections.get(client_socket);
 
     if (connection_opt == null) {
-        std.debug.print("TCP connection not found in client read", .{});
+        std.debug.print("TCP connection not found in client read\n", .{});
         allocator.destroy(data);
         return .disarm;
     }
     const connection = connection_opt.?;
 
     const read_len = result.read catch |e| {
-        std.debug.print("TCP {} {} client disconnected {}\n", .{ connection.client_address, connection.client_socket, e });
         if (e == xev.ReadError.EOF) {
+            std.debug.print("TCP client closed socket write {} {}\n", .{ connection.client_address, e });
             connection.onClientReadClosed();
         } else {
-            srv.removeConnection(socket, loop);
+            std.debug.print("TCP client read eror {} {}, active callbacks {}, write queue {}\n", .{
+                connection.client_address,
+                e,
+                loop.active,
+                connection.client_write_queue.len,
+            });
+            srv.removeConnection(client_socket, loop);
         }
         allocator.destroy(data);
         return .disarm;
     };
-    // std.debug.print("TCP client read {} bytes\n", .{read_len});
 
     const tcp_target_write_data = allocator.create(TargetWriteData) catch |e| {
-        std.debug.print("Could not allocate TCP target write completion {}\n", .{e});
-        srv.removeConnection(socket, loop);
+        std.debug.print("TCP could not allocate TCP target write completion {}\n", .{e});
+        srv.removeConnection(client_socket, loop);
         allocator.destroy(data);
         return .disarm;
     };
     tcp_target_write_data.* = TargetWriteData{
         .server = srv,
-        .connection = connection,
+        .client_socket = client_socket,
         .plaintext_buf = undefined,
         .completion = undefined,
     };
 
     const plaintext_len = connection.read(read_len, &tcp_target_write_data.plaintext_buf) catch |e| {
         std.debug.print("TCP could not decrypt client data {}\n", .{e});
-        srv.removeConnection(socket, loop);
+        srv.removeConnection(client_socket, loop);
         allocator.destroy(data);
         allocator.destroy(tcp_target_write_data);
         return .disarm;
@@ -165,8 +173,8 @@ fn tcpClientReadCallback(
     // std.debug.print("TCP client read text {s}\n", .{tcp_target_write_data.plaintext_buf[0..plaintext_len]});
 
     const connected = connection.connectToTarget() catch |e| {
-        std.debug.print("TCP could not connect to target {} {} {}\n", .{ connection.target_address, connection.target_address2, e });
-        srv.removeConnection(socket, loop);
+        std.debug.print("TCP could not connect to target {any} {}\n", .{ connection.target_address, e });
+        srv.removeConnection(client_socket, loop);
         allocator.destroy(data);
         allocator.destroy(tcp_target_write_data);
         return .disarm;
@@ -174,15 +182,15 @@ fn tcpClientReadCallback(
 
     if (connected) {
         const tcp_target_read_data = allocator.create(TargetReadData) catch |e| {
-            std.debug.print("Could not allocate TCP target read completion {}\n", .{e});
-            srv.removeConnection(socket, loop);
+            std.debug.print("TCP could not allocate target read completion {}\n", .{e});
+            srv.removeConnection(client_socket, loop);
             allocator.destroy(data);
             allocator.destroy(tcp_target_write_data);
             return .disarm;
         };
         tcp_target_read_data.* = TargetReadData{
             .server = srv,
-            .client_socket = socket,
+            .client_socket = client_socket,
             .target_socket = connection.target_socket.?,
             .completion = .{
                 .op = .{
@@ -212,30 +220,27 @@ fn tcpClientReadCallback(
         loop.add(&tcp_target_read_data.completion);
     }
 
-    tcp_target_write_data.completion = xev.Completion{
-        .op = .{
-            .write = .{
-                .fd = connection.target_socket.?,
-                .buffer = .{
-                    .slice = tcp_target_write_data.plaintext_buf[0..plaintext_len],
+    if (plaintext_len == 0) {
+        allocator.destroy(tcp_target_write_data);
+    } else {
+        tcp_target_write_data.completion = xev.Completion{
+            .op = .{
+                .write = .{
+                    .fd = connection.target_socket.?,
+                    .buffer = .{
+                        .slice = tcp_target_write_data.plaintext_buf[0..plaintext_len],
+                    },
                 },
             },
-        },
-        .userdata = tcp_target_write_data,
-        .callback = tcpTargetWriteCallback,
-    };
-    connection.target_writes += 1;
-    loop.add(&tcp_target_write_data.completion);
+            .userdata = tcp_target_write_data,
+            .callback = tcpTargetWriteCallback,
+        };
+        connection.target_writes += 1;
+        loop.add(&tcp_target_write_data.completion);
+    }
 
     return .rearm;
 }
-
-const TargetWriteData = struct {
-    connection: *TcpConnection,
-    server: *Server,
-    plaintext_buf: [16384]u8,
-    completion: xev.Completion,
-};
 
 fn tcpTargetWriteCallback(
     ud: ?*anyopaque,
@@ -245,8 +250,8 @@ fn tcpTargetWriteCallback(
 ) xev.CallbackAction {
     const data = @as(*TargetWriteData, @ptrCast(@alignCast(ud.?)));
     const srv = data.server;
+    const connection_opt = srv.tcp_connections.get(data.client_socket);
     const allocator = srv.allocator;
-    const connection = data.connection;
     defer allocator.destroy(data);
 
     const write_len = result.write catch |e| {
@@ -255,11 +260,16 @@ fn tcpTargetWriteCallback(
     };
     const data_len = comp.op.write.buffer.slice.len;
     if (data_len > write_len) {
-        std.debug.print("PARTIAL target write: {} {} \n", .{ write_len, data_len });
+        std.debug.print("TCP partial target write: {} {} \n", .{ write_len, data_len });
     }
 
-    // std.debug.print("TCP target write {} bytes\n", .{write_len});
+    if (connection_opt == null) {
+        std.debug.print("TCP connection not found in target write\n", .{});
+        return .disarm;
+    }
+    const connection = connection_opt.?;
     connection.onTargetWrite();
+
     return .disarm;
 }
 
@@ -281,20 +291,20 @@ fn tcpTargetReadCallback(
     const connection = connection_opt.?;
 
     const read_len = result.read catch |e| {
-        std.debug.print("TCP target read error {}\n", .{e});
         if (e == xev.ReadError.EOF) {
+            std.debug.print("TCP target closed socket read {} {}\n", .{ connection.client_address, e });
             connection.onTargetReadClosed(loop);
         } else {
-            srv.removeConnection(connection.client_socket, loop);
+            std.debug.print("TCP target read error {} {}\n", .{ connection.client_socket, e });
             connection.target_read_completion = null;
+            srv.removeConnection(connection.client_socket, loop);
         }
         allocator.destroy(data);
         return .disarm;
     };
-    // std.debug.print("TCP target read {} bytes\n", .{read_len});
 
     const tcp_client_write_data = allocator.create(ClientWriteData) catch |e| {
-        std.debug.print("Could not allocate TCP client write completion {}\n", .{e});
+        std.debug.print("TCP could not allocate client write completion {}\n", .{e});
         connection.disconnectFromTarget();
         allocator.destroy(data);
         return .disarm;
@@ -304,9 +314,11 @@ fn tcpTargetReadCallback(
         .connection = connection,
         .ciphertext = undefined,
         .completion = undefined,
+        .write_queue_node = ClientWriteQueue.Node{
+            .data = tcp_client_write_data,
+        },
     };
     const ciphertext_len = connection.write(read_len, &tcp_client_write_data.ciphertext);
-    // std.debug.print("TCP target read {} bytes\n", .{ciphertext_len});
 
     tcp_client_write_data.completion = .{
         .op = .{
@@ -321,17 +333,13 @@ fn tcpTargetReadCallback(
         .userdata = tcp_client_write_data,
     };
     connection.client_writes += 1;
-    loop.add(&tcp_client_write_data.completion);
+    connection.client_write_queue.append(&tcp_client_write_data.write_queue_node);
+    if (connection.client_write_queue.len == 1) {
+        loop.add(&tcp_client_write_data.completion);
+    }
 
     return .rearm;
 }
-
-const ClientWriteData = struct {
-    server: *Server,
-    connection: *TcpConnection,
-    ciphertext: [16384]u8,
-    completion: xev.Completion,
-};
 
 fn tcpClientWriteCallback(
     ud: ?*anyopaque,
@@ -344,17 +352,51 @@ fn tcpClientWriteCallback(
     const allocator = srv.allocator;
     defer allocator.destroy(data);
 
+    _ = data.connection.client_write_queue.popFirst();
     const write_len = result.write catch |e| {
         std.debug.print("TCP client write error {}\n", .{e});
         return .disarm;
     };
 
     const data_len = comp.op.write.buffer.slice.len;
-    if (data_len > write_len) {
-        std.debug.print("PARTIAL client write: {} {} \n", .{ write_len, data_len });
+    const remaining_len = data_len - write_len;
+    if (remaining_len > 0) {
+        std.debug.print("TCP partial client write: {} {}\n", .{ write_len, data_len });
+        const tcp_client_write_data = allocator.create(ClientWriteData) catch |e| {
+            std.debug.print("Could not allocate TCP partial client write {}\n", .{e});
+            return .disarm;
+        };
+        tcp_client_write_data.* = ClientWriteData{
+            .server = srv,
+            .connection = data.connection,
+            .ciphertext = undefined,
+            .completion = undefined,
+            .write_queue_node = ClientWriteQueue.Node{
+                .data = tcp_client_write_data,
+            },
+        };
+        @memcpy(tcp_client_write_data.ciphertext[0..remaining_len], data.ciphertext[write_len..data_len]);
+        tcp_client_write_data.completion = .{
+            .op = .{
+                .write = .{
+                    .fd = data.connection.client_socket,
+                    .buffer = .{
+                        .slice = tcp_client_write_data.ciphertext[0..remaining_len],
+                    },
+                },
+            },
+            .callback = tcpClientWriteCallback,
+            .userdata = tcp_client_write_data,
+        };
+        data.connection.client_writes += 1;
+        data.connection.client_write_queue.prepend(&tcp_client_write_data.write_queue_node);
     }
 
-    // std.debug.print("TCP client write {} bytes\n", .{write_len});
+    if (data.connection.client_write_queue.len != 0) {
+        const next_write = data.connection.client_write_queue.first.?;
+        loop.add(&next_write.data.completion);
+    }
+
     data.connection.onClientWrite(loop);
     return .disarm;
 }

@@ -48,22 +48,20 @@ pub const TcpConnection = struct {
     server: *Server,
 
     client_read_completion: ?*ClientReadData = null,
-
     client_read_closed: bool = false,
     client_socket_closed: bool = false,
     client_writes: u64 = 0,
+    client_write_queue: ClientWriteQueue = ClientWriteQueue{},
     client_address: net.Address,
     client_socket: posix.socket_t,
     client_stream_state: TcpClientStreamState = TcpClientStreamState.reading_salt,
 
     ciphertext_read_buf: [8192]u8 = undefined,
-    ciphertext_buf: [16384]u8 = undefined,
+    ciphertext_buf: [24576]u8 = undefined,
     ciphertext_remaining_len: usize = 0,
-
     decryptor: crypt.Encryptor = undefined,
 
     target_read_completion: ?*TargetReadData = null,
-
     target_read_closed: bool = false,
     target_writes: u64 = 0,
     target_address: net.Address = undefined,
@@ -71,24 +69,24 @@ pub const TcpConnection = struct {
     server_stream_state: TcpServerStreamState = TcpServerStreamState.writing_salt,
 
     target_read_buf: [8192]u8 = undefined,
-
     encryptor: crypt.Encryptor = undefined,
 
-    pub fn deinit(self: *TcpConnection, loop: *xev.Loop) void {
+    pub fn deinit(self: *TcpConnection, _: *xev.Loop) void {
         self.disconnectFromTarget();
         self.disconnectFromClient();
         if (self.target_read_completion != null) {
-            std.debug.print("TCP schedule cancel target read\n", .{});
-            const target_read_data = self.target_read_completion.?;
-            self.target_read_completion = null;
-            loop.add(&target_read_data.cancel_completion);
+            // std.debug.print("TCP schedule cancel target read\n", .{});
+            // const target_read_data = self.target_read_completion.?;
+            // self.target_read_completion = null;
+            // loop.add(&target_read_data.cancel_completion);
         }
     }
 
-    pub fn read(self: *TcpConnection, ciphertext_len: usize, plaintext_buf: []u8) !usize {
+    pub fn read(self: *TcpConnection, new_ciphertext_len: usize, plaintext_buf: []u8) !usize {
+        const ciphertext_len: usize = new_ciphertext_len + self.ciphertext_remaining_len;
         var plaintext_len: usize = 0;
         var ciphertext_idx: usize = 0;
-        @memcpy(self.ciphertext_buf[self.ciphertext_remaining_len .. self.ciphertext_remaining_len + ciphertext_len], self.ciphertext_read_buf[0..ciphertext_len]);
+        @memcpy(self.ciphertext_buf[self.ciphertext_remaining_len .. self.ciphertext_remaining_len + new_ciphertext_len], self.ciphertext_read_buf[0..new_ciphertext_len]);
 
         while (true) {
             const chunk_len = switch (self.client_stream_state) {
@@ -117,9 +115,8 @@ pub const TcpConnection = struct {
                     }
                     if (ciphertext_idx + crypt.PAYLOAD_LENGTH_SIZE + crypt.TAG_SIZE >= ciphertext_len) {
                         const remaining_len = ciphertext_len - ciphertext_idx;
-                        @memcpy(self.ciphertext_buf[0..remaining_len], self.ciphertext_buf[ciphertext_idx..ciphertext_len]);
+                        std.mem.copyForwards(u8, self.ciphertext_buf[0..remaining_len], self.ciphertext_buf[ciphertext_idx..ciphertext_len]);
                         self.ciphertext_remaining_len = remaining_len;
-                        std.debug.print("PARTIAL CHUNK before length\n", .{});
                         break :blk 0;
                     }
                     const payload_length_data = self.ciphertext_buf[ciphertext_idx .. ciphertext_idx + crypt.PAYLOAD_LENGTH_SIZE + crypt.TAG_SIZE];
@@ -135,8 +132,6 @@ pub const TcpConnection = struct {
                         plaintext_len += payload_length;
                         break :blk payload_length;
                     } else {
-                        std.debug.print("PARTIAL CHUNK after length {} {}\n", .{ciphertext_len, ciphertext_idx + payload_length + crypt.TAG_SIZE});
-                        
                         self.decryptor.decrementNonce();
                         ciphertext_idx -= crypt.PAYLOAD_LENGTH_SIZE + crypt.TAG_SIZE;
                         const remaining_len = ciphertext_len - ciphertext_idx;
@@ -213,7 +208,7 @@ pub const TcpConnection = struct {
         if (self.client_socket_closed) {
             return;
         }
-        std.debug.print("Disconnected from client\n", .{});
+        std.debug.print("TCP close client socket {}\n", .{self.client_address});
         posix.close(self.client_socket);
         self.client_socket_closed = true;
     }
@@ -222,7 +217,7 @@ pub const TcpConnection = struct {
         if (self.target_socket == null) {
             return;
         }
-        std.debug.print("Disconnected from target\n", .{});
+        std.debug.print("TCP close target socket {}\n", .{self.client_address});
         posix.close(self.target_socket.?);
         self.target_socket = null;
     }
@@ -230,35 +225,57 @@ pub const TcpConnection = struct {
     pub fn onClientReadClosed(self: *TcpConnection) void {
         self.client_read_closed = true;
         if (self.target_writes == 0) {
-            std.debug.print("onClientReadClosed\n", .{});
-            posix.shutdown(self.target_socket.?, .send) catch @panic("sht");
+            if (self.target_socket != null) {
+                std.debug.print("TCP shutdown target socket write {}\n", .{self.client_address});
+                posix.shutdown(self.target_socket.?, .send) catch |e| {
+                    std.debug.print("TCP error on shutdown target send {} {}\n", .{ self.client_address, e });
+                };
+            }
         }
     }
 
     pub fn onTargetWrite(self: *TcpConnection) void {
         self.target_writes -= 1;
         if (self.client_read_closed and self.target_writes == 0) {
-            std.debug.print("onTargetWrite\n", .{});
-            posix.shutdown(self.target_socket.?, .send) catch @panic("sht");
+            if (self.target_socket != null) {
+                std.debug.print("TCP shutdown target socket write {}\n", .{self.client_address});
+                posix.shutdown(self.target_socket.?, .send) catch |e| {
+                    std.debug.print("TCP error on shutdown target send {} {}\n", .{ self.client_address, e });
+                };
+            }
         }
     }
 
-    pub fn onTargetReadClosed(self: *TcpConnection, _: *xev.Loop) void {
+    pub fn onTargetReadClosed(self: *TcpConnection, loop: *xev.Loop) void {
         self.disconnectFromTarget();
         self.target_read_closed = true;
         if (self.client_writes == 0) {
-            std.debug.print("onTargetReadClosed\n", .{});
-            self.disconnectFromClient();
+            if (!self.client_read_closed) {
+                self.client_read_closed = true;
+                posix.shutdown(self.client_socket, .send) catch |e| {
+                    std.debug.print("TCP error on shutdown client send {} {}\n", .{ self.client_address, e });
+                };
+            }
             self.disconnectFromTarget();
+            self.disconnectFromClient();
+            std.debug.print("TCP deleting connection {}\n", .{self.client_address});
+            self.server.removeConnection(self.client_socket, loop);
         }
     }
 
-    pub fn onClientWrite(self: *TcpConnection, _: *xev.Loop) void {
+    pub fn onClientWrite(self: *TcpConnection, loop: *xev.Loop) void {
         self.client_writes -= 1;
         if (self.target_read_closed and self.client_writes == 0) {
-            std.debug.print("onClientWrite\n", .{});
+            if (!self.client_read_closed) {
+                self.client_read_closed = true;
+                posix.shutdown(self.client_socket, .send) catch |e| {
+                    std.debug.print("TCP error on shutdown client send {} {}\n", .{ self.client_address, e });
+                };
+            }
             self.disconnectFromClient();
             self.disconnectFromTarget();
+            std.debug.print("TCP deleting connection {}\n", .{self.client_address});
+            self.server.removeConnection(self.client_socket, loop);
         }
     }
 };
@@ -283,6 +300,13 @@ pub const ClientReadData = struct {
     cancel_completion: xev.Completion,
 };
 
+pub const TargetWriteData = struct {
+    server: *Server,
+    client_socket: posix.socket_t,
+    plaintext_buf: [24576]u8,
+    completion: xev.Completion,
+};
+
 pub const TargetReadData = struct {
     server: *Server,
     client_socket: posix.socket_t,
@@ -290,3 +314,13 @@ pub const TargetReadData = struct {
     completion: xev.Completion,
     cancel_completion: xev.Completion,
 };
+
+pub const ClientWriteData = struct {
+    server: *Server,
+    connection: *TcpConnection,
+    ciphertext: [24576]u8,
+    write_queue_node: ClientWriteQueue.Node,
+    completion: xev.Completion,
+};
+
+pub const ClientWriteQueue = std.DoublyLinkedList(*ClientWriteData);
