@@ -185,7 +185,6 @@ fn tcpClientReadCallback(
         tcp_target_read_data.* = TargetReadData{
             .server = srv,
             .client_socket = client_socket,
-            .target_socket = relay.target_socket.?,
             .completion = .{
                 .op = .{
                     .read = .{
@@ -235,7 +234,7 @@ fn tcpClientReadCallback(
 
 fn tcpTargetWriteCallback(
     ud: ?*anyopaque,
-    _: *xev.Loop,
+    loop: *xev.Loop,
     comp: *xev.Completion,
     result: xev.Result,
 ) xev.CallbackAction {
@@ -244,8 +243,16 @@ fn tcpTargetWriteCallback(
     const allocator = srv.allocator;
     defer allocator.destroy(data);
 
+    const relay_opt = srv.tcp_relays.get(data.client_socket);
+    if (relay_opt == null) {
+        std.debug.print("TCP relay not found in target write callback\n", .{});
+        return .disarm;
+    }
+    const relay = relay_opt.?;
+
     const write_len = result.write catch |e| {
         std.debug.print("TCP target write error {}\n", .{e});
+        srv.removeTcpRelay(data.client_socket, loop);
         return .disarm;
     };
     const data_len = comp.op.write.buffer.slice.len;
@@ -253,14 +260,7 @@ fn tcpTargetWriteCallback(
         std.debug.print("TCP partial target write: {} {} \n", .{ write_len, data_len });
     }
 
-    const relay_opt = srv.tcp_relays.get(data.client_socket);
-    if (relay_opt == null) {
-        std.debug.print("TCP relay not found in target write callback\n", .{});
-        return .disarm;
-    }
-    const relay = relay_opt.?;
     relay.onTargetWrite();
-
     return .disarm;
 }
 
@@ -273,6 +273,7 @@ fn tcpTargetReadCallback(
     const data = @as(*TargetReadData, @ptrCast(@alignCast(ud.?)));
     const srv = data.server;
     const allocator = srv.allocator;
+    
     const relay_opt = srv.tcp_relays.get(data.client_socket);
     if (relay_opt == null) {
         std.debug.print("TCP relay not found in target read callback\n", .{});
@@ -296,7 +297,7 @@ fn tcpTargetReadCallback(
 
     const tcp_client_write_data = allocator.create(ClientWriteData) catch |e| {
         std.debug.print("TCP could not allocate client write completion {}\n", .{e});
-        relay.disconnectFromTarget();
+        srv.removeTcpRelay(relay.client_socket, loop);
         allocator.destroy(data);
         return .disarm;
     };
@@ -354,6 +355,7 @@ fn tcpClientWriteCallback(
 
     const write_len = result.write catch |e| {
         std.debug.print("TCP client write error {}\n", .{e});
+        srv.removeTcpRelay(client_socket, loop);
         return .disarm;
     };
 
@@ -363,6 +365,7 @@ fn tcpClientWriteCallback(
         std.debug.print("TCP partial client write: {} {}\n", .{ write_len, data_len });
         const tcp_client_write_data = allocator.create(ClientWriteData) catch |e| {
             std.debug.print("Could not allocate TCP partial client write {}\n", .{e});
+            srv.removeTcpRelay(client_socket, loop);
             return .disarm;
         };
         tcp_client_write_data.* = ClientWriteData{

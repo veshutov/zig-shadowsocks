@@ -299,7 +299,6 @@ pub const TargetWriteData = struct {
 pub const TargetReadData = struct {
     server: *Server,
     client_socket: posix.socket_t,
-    target_socket: posix.socket_t,
     completion: xev.Completion,
     cancel_completion: xev.Completion,
 };
