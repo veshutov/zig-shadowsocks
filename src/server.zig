@@ -94,7 +94,7 @@ pub const TcpRelay = struct {
 
                 .reading_address => blk: {
                     const decrypt_result = try self.decryptor.decryptChunk(self.ciphertext_buf[ciphertext_idx..], plaintext_buf);
-                    const target_address = try utils.parseAddress(plaintext_buf[0..decrypt_result.plaintext_written]);
+                    const target_address = try utils.parseAddress(self.server.allocator, plaintext_buf[0..decrypt_result.plaintext_written]);
                     self.target_address = target_address;
                     ciphertext_idx += decrypt_result.ciphertext_read;
                     self.client_stream_state = .reading_chunk;
