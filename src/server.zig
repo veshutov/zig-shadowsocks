@@ -70,9 +70,9 @@ pub const TcpRelay = struct {
     encryptor: crypt.Encryptor = undefined,
     server_stream_state: TcpServerStreamState = TcpServerStreamState.writing_salt,
 
-    pub fn deinit(self: *TcpRelay, _: *xev.Loop) void {
-        self.disconnectFromTarget();
-        self.disconnectFromClient();
+    pub fn deinit(self: *TcpRelay, loop: *xev.Loop) void {
+        self.disconnectFromTarget(loop);
+        self.disconnectFromClient(loop);
     }
 
     pub fn read(self: *TcpRelay, new_ciphertext_len: usize, plaintext_buf: []u8) !usize {
@@ -198,21 +198,21 @@ pub const TcpRelay = struct {
         return true;
     }
 
-    pub fn disconnectFromClient(self: *TcpRelay) void {
+    pub fn disconnectFromClient(self: *TcpRelay, loop: *xev.Loop) void {
         if (self.client_socket_closed) {
             return;
         }
         std.debug.print("TCP close client socket {}\n", .{self.client_address});
-        posix.close(self.client_socket);
+        self.scheduleClose(loop, self.client_socket);
         self.client_socket_closed = true;
     }
 
-    pub fn disconnectFromTarget(self: *TcpRelay) void {
+    pub fn disconnectFromTarget(self: *TcpRelay, loop: *xev.Loop) void {
         if (self.target_socket_closed) {
             return;
         }
         std.debug.print("TCP close target socket {}\n", .{self.client_address});
-        posix.close(self.target_socket);
+        self.scheduleClose(loop, self.target_socket);
         self.target_socket_closed = true;
     }
 
@@ -241,11 +241,9 @@ pub const TcpRelay = struct {
     }
 
     pub fn onTargetReadClosed(self: *TcpRelay, loop: *xev.Loop) void {
-        self.disconnectFromTarget();
+        self.disconnectFromTarget(loop);
         if (self.client_writes == 0) {
-            posix.shutdown(self.client_socket, .send) catch |e| {
-                std.debug.print("TCP error on shutdown client send {} {}\n", .{ self.client_address, e });
-            };
+            self.scheduleShutdown(loop, self.client_socket, .send);
             std.debug.print("TCP deleting relay {}\n", .{self.client_address});
             self.server.removeTcpRelay(self.client_socket, loop);
         }
@@ -254,12 +252,74 @@ pub const TcpRelay = struct {
     pub fn onClientWrite(self: *TcpRelay, loop: *xev.Loop) void {
         self.client_writes -= 1;
         if (self.target_socket_closed and self.client_writes == 0) {
-            posix.shutdown(self.client_socket, .send) catch |e| {
-                std.debug.print("TCP error on shutdown client send {} {}\n", .{ self.client_address, e });
-            };
+            self.scheduleShutdown(loop, self.client_socket, .send);
             std.debug.print("TCP deleting relay {}\n", .{self.client_address});
             self.server.removeTcpRelay(self.client_socket, loop);
         }
+    }
+
+    fn scheduleShutdown(self: *TcpRelay, loop: *xev.Loop, socket: posix.socket_t, how: posix.ShutdownHow) void {
+        const shutdown_completion = self.server.allocator.create(xev.Completion) catch |e| {
+            std.debug.print("TCP could not allocate shutdown completion {}\n", .{e});
+            posix.shutdown(socket, how) catch |err| {
+                std.debug.print("TCP error on shutdown {}\n", .{err});
+            };
+            return;
+        };
+        shutdown_completion.* = .{
+            .op = .{
+                .shutdown = .{
+                    .socket = socket,
+                    .how = how,
+                },
+            },
+            .userdata = &self.server.allocator,
+            .callback = shutdownOrCloseCallback,
+        };
+        loop.add(shutdown_completion);
+    }
+
+    fn scheduleClose(self: *TcpRelay, loop: *xev.Loop, socket: posix.socket_t) void {
+        const close_completion = self.server.allocator.create(xev.Completion) catch |e| {
+            std.debug.print("TCP could not allocate close completion {}\n", .{e});
+            posix.close(socket);
+            return;
+        };
+        close_completion.* = .{
+            .op = .{
+                .close = .{
+                    .fd = socket,
+                },
+            },
+            .userdata = &self.server.allocator,
+            .callback = shutdownOrCloseCallback,
+        };
+        loop.add(close_completion);
+    }
+
+    fn shutdownOrCloseCallback(
+        ud: ?*anyopaque,
+        _: *xev.Loop,
+        comp: *xev.Completion,
+        result: xev.Result,
+    ) xev.CallbackAction {
+        const allocator = @as(*std.mem.Allocator, @ptrCast(@alignCast(ud.?)));
+        defer allocator.destroy(comp);
+
+        switch (result) {
+            .close => {
+                result.close catch |e| {
+                    std.debug.print("TCP close failed {}\n", .{e});
+                };
+            },
+            .shutdown => {
+                result.close catch |e| {
+                    std.debug.print("TCP shutdown failed {}\n", .{e});
+                };
+            },
+            else => {},
+        }
+        return .disarm;
     }
 };
 
