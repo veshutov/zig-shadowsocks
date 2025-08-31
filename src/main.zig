@@ -188,7 +188,7 @@ fn tcpClientReadCallback(
             .completion = .{
                 .op = .{
                     .read = .{
-                        .fd = relay.target_socket.?,
+                        .fd = relay.target_socket,
                         .buffer = .{
                             .slice = &relay.target_read_buf,
                         },
@@ -201,7 +201,7 @@ fn tcpClientReadCallback(
                 .op = .{
                     .shutdown = .{
                         .how = .both,
-                        .socket = relay.target_socket.?,
+                        .socket = relay.target_socket,
                     },
                 },
             },
@@ -216,7 +216,7 @@ fn tcpClientReadCallback(
         tcp_target_write_data.completion = xev.Completion{
             .op = .{
                 .write = .{
-                    .fd = relay.target_socket.?,
+                    .fd = relay.target_socket,
                     .buffer = .{
                         .slice = tcp_target_write_data.plaintext_buf[0..plaintext_len],
                     },

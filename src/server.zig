@@ -63,9 +63,11 @@ pub const TcpRelay = struct {
 
     target_read_completion: ?*TargetReadData = null,
     target_read_closed: bool = false,
+    target_connected: bool = false,
+    target_socket_closed: bool = false,
     target_writes: u64 = 0,
     target_address: net.Address = undefined,
-    target_socket: ?posix.socket_t = null,
+    target_socket: posix.socket_t = undefined,
     server_stream_state: TcpServerStreamState = TcpServerStreamState.writing_salt,
 
     target_read_buf: [8192]u8 = undefined,
@@ -190,11 +192,12 @@ pub const TcpRelay = struct {
     }
 
     pub fn connectToTarget(self: *TcpRelay) !bool {
-        if (self.target_socket != null) {
+        if (self.target_connected) {
             return false;
         }
         const target_stream = try net.tcpConnectToAddress(self.target_address);
         self.target_socket = target_stream.handle;
+        self.target_connected = true;
         return true;
     }
 
@@ -208,20 +211,20 @@ pub const TcpRelay = struct {
     }
 
     pub fn disconnectFromTarget(self: *TcpRelay) void {
-        if (self.target_socket == null) {
+        if (self.target_socket_closed) {
             return;
         }
         std.debug.print("TCP close target socket {}\n", .{self.client_address});
-        posix.close(self.target_socket.?);
-        self.target_socket = null;
+        posix.close(self.target_socket);
+        self.target_socket_closed = true;
     }
 
     pub fn onClientReadClosed(self: *TcpRelay) void {
         self.client_read_closed = true;
         if (self.target_writes == 0) {
-            if (self.target_socket != null) {
+            if (!self.target_socket_closed) {
                 std.debug.print("TCP shutdown target socket write {}\n", .{self.client_address});
-                posix.shutdown(self.target_socket.?, .send) catch |e| {
+                posix.shutdown(self.target_socket, .send) catch |e| {
                     std.debug.print("TCP error on shutdown target send {} {}\n", .{ self.client_address, e });
                 };
             }
@@ -231,9 +234,9 @@ pub const TcpRelay = struct {
     pub fn onTargetWrite(self: *TcpRelay) void {
         self.target_writes -= 1;
         if (self.client_read_closed and self.target_writes == 0) {
-            if (self.target_socket != null) {
+            if (!self.target_socket_closed) {
                 std.debug.print("TCP shutdown target socket write {}\n", .{self.client_address});
-                posix.shutdown(self.target_socket.?, .send) catch |e| {
+                posix.shutdown(self.target_socket, .send) catch |e| {
                     std.debug.print("TCP error on shutdown target send {} {}\n", .{ self.client_address, e });
                 };
             }
