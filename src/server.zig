@@ -47,31 +47,28 @@ pub const Server = struct {
 pub const TcpRelay = struct {
     server: *Server,
 
-    client_read_completion: ?*ClientReadData = null,
+    client_address: net.Address,
+    client_socket: posix.socket_t,
     client_read_closed: bool = false,
     client_socket_closed: bool = false,
     client_writes: u64 = 0,
     client_write_queue: ClientWriteQueue = ClientWriteQueue{},
-    client_address: net.Address,
-    client_socket: posix.socket_t,
-    client_stream_state: TcpClientStreamState = TcpClientStreamState.reading_salt,
 
     ciphertext_read_buf: [8192]u8 = undefined,
     ciphertext_buf: [24576]u8 = undefined,
     ciphertext_remaining_len: usize = 0,
     decryptor: crypt.Encryptor = undefined,
+    client_stream_state: TcpClientStreamState = TcpClientStreamState.reading_salt,
 
-    target_read_completion: ?*TargetReadData = null,
-    target_read_closed: bool = false,
+    target_address: net.Address = undefined,
     target_connected: bool = false,
+    target_socket: posix.socket_t = undefined,
     target_socket_closed: bool = false,
     target_writes: u64 = 0,
-    target_address: net.Address = undefined,
-    target_socket: posix.socket_t = undefined,
-    server_stream_state: TcpServerStreamState = TcpServerStreamState.writing_salt,
 
     target_read_buf: [8192]u8 = undefined,
     encryptor: crypt.Encryptor = undefined,
+    server_stream_state: TcpServerStreamState = TcpServerStreamState.writing_salt,
 
     pub fn deinit(self: *TcpRelay, _: *xev.Loop) void {
         self.disconnectFromTarget();
@@ -245,14 +242,10 @@ pub const TcpRelay = struct {
 
     pub fn onTargetReadClosed(self: *TcpRelay, loop: *xev.Loop) void {
         self.disconnectFromTarget();
-        self.target_read_closed = true;
         if (self.client_writes == 0) {
-            if (!self.client_read_closed) {
-                self.client_read_closed = true;
-                posix.shutdown(self.client_socket, .send) catch |e| {
-                    std.debug.print("TCP error on shutdown client send {} {}\n", .{ self.client_address, e });
-                };
-            }
+            posix.shutdown(self.client_socket, .send) catch |e| {
+                std.debug.print("TCP error on shutdown client send {} {}\n", .{ self.client_address, e });
+            };
             std.debug.print("TCP deleting relay {}\n", .{self.client_address});
             self.server.removeTcpRelay(self.client_socket, loop);
         }
@@ -260,13 +253,10 @@ pub const TcpRelay = struct {
 
     pub fn onClientWrite(self: *TcpRelay, loop: *xev.Loop) void {
         self.client_writes -= 1;
-        if (self.target_read_closed and self.client_writes == 0) {
-            if (!self.client_read_closed) {
-                self.client_read_closed = true;
-                posix.shutdown(self.client_socket, .send) catch |e| {
-                    std.debug.print("TCP error on shutdown client send {} {}\n", .{ self.client_address, e });
-                };
-            }
+        if (self.target_socket_closed and self.client_writes == 0) {
+            posix.shutdown(self.client_socket, .send) catch |e| {
+                std.debug.print("TCP error on shutdown client send {} {}\n", .{ self.client_address, e });
+            };
             std.debug.print("TCP deleting relay {}\n", .{self.client_address});
             self.server.removeTcpRelay(self.client_socket, loop);
         }

@@ -104,7 +104,6 @@ fn tcpAcceptCallback(
         },
     };
     loop.add(&tcp_client_read_completion.completion);
-    relay.client_read_completion = tcp_client_read_completion;
 
     return .rearm;
 }
@@ -206,7 +205,6 @@ fn tcpClientReadCallback(
                 },
             },
         };
-        relay.target_read_completion = tcp_target_read_data;
         loop.add(&tcp_target_read_data.completion);
     }
 
@@ -288,7 +286,6 @@ fn tcpTargetReadCallback(
             relay.onTargetReadClosed(loop);
         } else {
             std.debug.print("TCP target read error {} {}\n", .{ relay.client_socket, e });
-            relay.target_read_completion = null;
             srv.removeTcpRelay(relay.client_socket, loop);
         }
         allocator.destroy(data);
