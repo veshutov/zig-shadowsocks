@@ -11,11 +11,11 @@ pub const Server = struct {
     address: net.Address,
     allocator: std.mem.Allocator,
     tcp_listener: std.posix.socket_t = undefined,
-    tcp_connections: TcpConnections = undefined,
+    tcp_relays: TcpRelayMap = undefined,
 
     pub fn init(self: *Server) !void {
         const address = self.address;
-        self.tcp_connections = TcpConnections.init(self.allocator);
+        self.tcp_relays = TcpRelayMap.init(self.allocator);
         const tcp_listener = try posix.socket(address.any.family, posix.SOCK.STREAM, posix.IPPROTO.TCP);
         errdefer posix.close(tcp_listener);
         try posix.setsockopt(tcp_listener, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
@@ -28,23 +28,23 @@ pub const Server = struct {
 
     pub fn deinit(self: *Server) void {
         posix.close(self.tcp_listener);
-        self.tcp_connections.deinit();
+        self.tcp_relays.deinit();
     }
 
-    pub fn addConnection(self: *Server, connection: *TcpConnection) !void {
-        try self.tcp_connections.put(connection.client_socket, connection);
+    pub fn addTcpRelay(self: *Server, relay: *TcpRelay) !void {
+        try self.tcp_relays.put(relay.client_socket, relay);
     }
 
-    pub fn removeConnection(self: *Server, socket: posix.socket_t, loop: *xev.Loop) void {
-        const connection_entry = self.tcp_connections.fetchRemove(socket);
-        if (connection_entry) |connection| {
-            connection.value.deinit(loop);
-            self.allocator.destroy(connection.value);
+    pub fn removeTcpRelay(self: *Server, socket: posix.socket_t, loop: *xev.Loop) void {
+        const relay_entry = self.tcp_relays.fetchRemove(socket);
+        if (relay_entry) |relay| {
+            relay.value.deinit(loop);
+            self.allocator.destroy(relay.value);
         }
     }
 };
 
-pub const TcpConnection = struct {
+pub const TcpRelay = struct {
     server: *Server,
 
     client_read_completion: ?*ClientReadData = null,
@@ -71,7 +71,7 @@ pub const TcpConnection = struct {
     target_read_buf: [8192]u8 = undefined,
     encryptor: crypt.Encryptor = undefined,
 
-    pub fn deinit(self: *TcpConnection, _: *xev.Loop) void {
+    pub fn deinit(self: *TcpRelay, _: *xev.Loop) void {
         self.disconnectFromTarget();
         self.disconnectFromClient();
         if (self.target_read_completion != null) {
@@ -82,7 +82,7 @@ pub const TcpConnection = struct {
         }
     }
 
-    pub fn read(self: *TcpConnection, new_ciphertext_len: usize, plaintext_buf: []u8) !usize {
+    pub fn read(self: *TcpRelay, new_ciphertext_len: usize, plaintext_buf: []u8) !usize {
         const ciphertext_len: usize = new_ciphertext_len + self.ciphertext_remaining_len;
         var plaintext_len: usize = 0;
         var ciphertext_idx: usize = 0;
@@ -149,7 +149,7 @@ pub const TcpConnection = struct {
         return plaintext_len;
     }
 
-    pub fn write(self: *TcpConnection, plaintext_len: usize, ciphertext_buf: []u8) usize {
+    pub fn write(self: *TcpRelay, plaintext_len: usize, ciphertext_buf: []u8) usize {
         var ciphertext_len: usize = 0;
         var plaintext_idx: usize = 0;
 
@@ -195,7 +195,7 @@ pub const TcpConnection = struct {
         return ciphertext_len;
     }
 
-    pub fn connectToTarget(self: *TcpConnection) !bool {
+    pub fn connectToTarget(self: *TcpRelay) !bool {
         if (self.target_socket != null) {
             return false;
         }
@@ -204,7 +204,7 @@ pub const TcpConnection = struct {
         return true;
     }
 
-    pub fn disconnectFromClient(self: *TcpConnection) void {
+    pub fn disconnectFromClient(self: *TcpRelay) void {
         if (self.client_socket_closed) {
             return;
         }
@@ -213,7 +213,7 @@ pub const TcpConnection = struct {
         self.client_socket_closed = true;
     }
 
-    pub fn disconnectFromTarget(self: *TcpConnection) void {
+    pub fn disconnectFromTarget(self: *TcpRelay) void {
         if (self.target_socket == null) {
             return;
         }
@@ -222,7 +222,7 @@ pub const TcpConnection = struct {
         self.target_socket = null;
     }
 
-    pub fn onClientReadClosed(self: *TcpConnection) void {
+    pub fn onClientReadClosed(self: *TcpRelay) void {
         self.client_read_closed = true;
         if (self.target_writes == 0) {
             if (self.target_socket != null) {
@@ -234,7 +234,7 @@ pub const TcpConnection = struct {
         }
     }
 
-    pub fn onTargetWrite(self: *TcpConnection) void {
+    pub fn onTargetWrite(self: *TcpRelay) void {
         self.target_writes -= 1;
         if (self.client_read_closed and self.target_writes == 0) {
             if (self.target_socket != null) {
@@ -246,7 +246,7 @@ pub const TcpConnection = struct {
         }
     }
 
-    pub fn onTargetReadClosed(self: *TcpConnection, loop: *xev.Loop) void {
+    pub fn onTargetReadClosed(self: *TcpRelay, loop: *xev.Loop) void {
         self.disconnectFromTarget();
         self.target_read_closed = true;
         if (self.client_writes == 0) {
@@ -258,12 +258,12 @@ pub const TcpConnection = struct {
             }
             self.disconnectFromTarget();
             self.disconnectFromClient();
-            std.debug.print("TCP deleting connection {}\n", .{self.client_address});
-            self.server.removeConnection(self.client_socket, loop);
+            std.debug.print("TCP deleting relay {}\n", .{self.client_address});
+            self.server.removeTcpRelay(self.client_socket, loop);
         }
     }
 
-    pub fn onClientWrite(self: *TcpConnection, loop: *xev.Loop) void {
+    pub fn onClientWrite(self: *TcpRelay, loop: *xev.Loop) void {
         self.client_writes -= 1;
         if (self.target_read_closed and self.client_writes == 0) {
             if (!self.client_read_closed) {
@@ -274,8 +274,8 @@ pub const TcpConnection = struct {
             }
             self.disconnectFromClient();
             self.disconnectFromTarget();
-            std.debug.print("TCP deleting connection {}\n", .{self.client_address});
-            self.server.removeConnection(self.client_socket, loop);
+            std.debug.print("TCP deleting relay {}\n", .{self.client_address});
+            self.server.removeTcpRelay(self.client_socket, loop);
         }
     }
 };
@@ -291,11 +291,11 @@ pub const TcpServerStreamState = enum {
     writing_chunk,
 };
 
-pub const TcpConnections = std.AutoHashMap(posix.socket_t, *TcpConnection);
+pub const TcpRelayMap = std.AutoHashMap(posix.socket_t, *TcpRelay);
 
 pub const ClientReadData = struct {
     server: *Server,
-    connection: *TcpConnection,
+    relay: *TcpRelay,
     completion: xev.Completion,
     cancel_completion: xev.Completion,
 };
@@ -317,7 +317,7 @@ pub const TargetReadData = struct {
 
 pub const ClientWriteData = struct {
     server: *Server,
-    connection: *TcpConnection,
+    relay: *TcpRelay,
     ciphertext: [24576]u8,
     write_queue_node: ClientWriteQueue.Node,
     completion: xev.Completion,

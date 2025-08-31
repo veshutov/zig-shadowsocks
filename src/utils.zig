@@ -34,6 +34,7 @@ pub fn parseAddress(payload: []const u8) !net.Address {
             defer address_list.deinit();
 
             for (address_list.addrs) |addr| {
+                // prefer ipv4
                 if (addr.any.family == std.posix.AF.INET) {
                     return addr;
                 }
