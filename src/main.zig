@@ -82,7 +82,6 @@ fn tcpAcceptCallback(
     };
     tcp_client_read_completion.* = ClientReadData{
         .server = srv,
-        .relay = relay,
         .completion = .{
             .op = .{
                 .read = .{
@@ -118,13 +117,12 @@ fn tcpClientReadCallback(
 ) xev.CallbackAction {
     const data = @as(*ClientReadData, @ptrCast(@alignCast(ud.?)));
     const srv = data.server;
-    const read = comp.op.read;
-    const client_socket = read.fd;
+    const client_socket = comp.op.read.fd;
     const allocator = srv.allocator;
-    const relay_opt = srv.tcp_relays.get(client_socket);
 
+    const relay_opt = srv.tcp_relays.get(client_socket);
     if (relay_opt == null) {
-        std.debug.print("TCP relay not found in client read\n", .{});
+        std.debug.print("TCP relay not found in client read callback\n", .{});
         allocator.destroy(data);
         return .disarm;
     }
@@ -167,7 +165,6 @@ fn tcpClientReadCallback(
         allocator.destroy(tcp_target_write_data);
         return .disarm;
     };
-    // std.debug.print("TCP client read text {s}\n", .{tcp_target_write_data.plaintext_buf[0..plaintext_len]});
 
     const connected = relay.connectToTarget() catch |e| {
         std.debug.print("TCP could not connect to target {any} {}\n", .{ relay.target_address, e });
@@ -244,7 +241,6 @@ fn tcpTargetWriteCallback(
 ) xev.CallbackAction {
     const data = @as(*TargetWriteData, @ptrCast(@alignCast(ud.?)));
     const srv = data.server;
-    const relay_opt = srv.tcp_relays.get(data.client_socket);
     const allocator = srv.allocator;
     defer allocator.destroy(data);
 
@@ -257,8 +253,9 @@ fn tcpTargetWriteCallback(
         std.debug.print("TCP partial target write: {} {} \n", .{ write_len, data_len });
     }
 
+    const relay_opt = srv.tcp_relays.get(data.client_socket);
     if (relay_opt == null) {
-        std.debug.print("TCP relay not found in target write\n", .{});
+        std.debug.print("TCP relay not found in target write callback\n", .{});
         return .disarm;
     }
     const relay = relay_opt.?;
@@ -275,10 +272,10 @@ fn tcpTargetReadCallback(
 ) xev.CallbackAction {
     const data = @as(*TargetReadData, @ptrCast(@alignCast(ud.?)));
     const srv = data.server;
-    const relay_opt = srv.tcp_relays.get(data.client_socket);
     const allocator = srv.allocator;
+    const relay_opt = srv.tcp_relays.get(data.client_socket);
     if (relay_opt == null) {
-        std.debug.print("TCP relay not found in target read\n", .{});
+        std.debug.print("TCP relay not found in target read callback\n", .{});
         allocator.destroy(data);
         return .disarm;
     }
@@ -305,7 +302,6 @@ fn tcpTargetReadCallback(
     };
     tcp_client_write_data.* = ClientWriteData{
         .server = srv,
-        .relay = relay,
         .ciphertext = undefined,
         .completion = undefined,
         .write_queue_node = ClientWriteQueue.Node{
@@ -343,10 +339,19 @@ fn tcpClientWriteCallback(
 ) xev.CallbackAction {
     const data = @as(*ClientWriteData, @ptrCast(@alignCast(ud.?)));
     const srv = data.server;
+    const client_socket = comp.op.write.fd;
     const allocator = srv.allocator;
     defer allocator.destroy(data);
 
-    _ = data.relay.client_write_queue.popFirst();
+    const relay_opt = srv.tcp_relays.get(client_socket);
+    if (relay_opt == null) {
+        std.debug.print("TCP relay not found in client write callback\n", .{});
+        return .disarm;
+    }
+    const relay = relay_opt.?;
+
+    _ = relay.client_write_queue.popFirst();
+
     const write_len = result.write catch |e| {
         std.debug.print("TCP client write error {}\n", .{e});
         return .disarm;
@@ -362,7 +367,6 @@ fn tcpClientWriteCallback(
         };
         tcp_client_write_data.* = ClientWriteData{
             .server = srv,
-            .relay = data.relay,
             .ciphertext = undefined,
             .completion = undefined,
             .write_queue_node = ClientWriteQueue.Node{
@@ -373,7 +377,7 @@ fn tcpClientWriteCallback(
         tcp_client_write_data.completion = .{
             .op = .{
                 .write = .{
-                    .fd = data.relay.client_socket,
+                    .fd = relay.client_socket,
                     .buffer = .{
                         .slice = tcp_client_write_data.ciphertext[0..remaining_len],
                     },
@@ -382,15 +386,15 @@ fn tcpClientWriteCallback(
             .callback = tcpClientWriteCallback,
             .userdata = tcp_client_write_data,
         };
-        data.relay.client_writes += 1;
-        data.relay.client_write_queue.prepend(&tcp_client_write_data.write_queue_node);
+        relay.client_writes += 1;
+        relay.client_write_queue.prepend(&tcp_client_write_data.write_queue_node);
     }
 
-    if (data.relay.client_write_queue.len != 0) {
-        const next_write = data.relay.client_write_queue.first.?;
+    if (relay.client_write_queue.len != 0) {
+        const next_write = relay.client_write_queue.first.?;
         loop.add(&next_write.data.completion);
     }
 
-    data.relay.onClientWrite(loop);
+    relay.onClientWrite(loop);
     return .disarm;
 }

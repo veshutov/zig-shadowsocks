@@ -74,12 +74,6 @@ pub const TcpRelay = struct {
     pub fn deinit(self: *TcpRelay, _: *xev.Loop) void {
         self.disconnectFromTarget();
         self.disconnectFromClient();
-        if (self.target_read_completion != null) {
-            // std.debug.print("TCP schedule cancel target read\n", .{});
-            // const target_read_data = self.target_read_completion.?;
-            // self.target_read_completion = null;
-            // loop.add(&target_read_data.cancel_completion);
-        }
     }
 
     pub fn read(self: *TcpRelay, new_ciphertext_len: usize, plaintext_buf: []u8) !usize {
@@ -256,8 +250,6 @@ pub const TcpRelay = struct {
                     std.debug.print("TCP error on shutdown client send {} {}\n", .{ self.client_address, e });
                 };
             }
-            self.disconnectFromTarget();
-            self.disconnectFromClient();
             std.debug.print("TCP deleting relay {}\n", .{self.client_address});
             self.server.removeTcpRelay(self.client_socket, loop);
         }
@@ -272,8 +264,6 @@ pub const TcpRelay = struct {
                     std.debug.print("TCP error on shutdown client send {} {}\n", .{ self.client_address, e });
                 };
             }
-            self.disconnectFromClient();
-            self.disconnectFromTarget();
             std.debug.print("TCP deleting relay {}\n", .{self.client_address});
             self.server.removeTcpRelay(self.client_socket, loop);
         }
@@ -295,7 +285,6 @@ pub const TcpRelayMap = std.AutoHashMap(posix.socket_t, *TcpRelay);
 
 pub const ClientReadData = struct {
     server: *Server,
-    relay: *TcpRelay,
     completion: xev.Completion,
     cancel_completion: xev.Completion,
 };
@@ -317,7 +306,6 @@ pub const TargetReadData = struct {
 
 pub const ClientWriteData = struct {
     server: *Server,
-    relay: *TcpRelay,
     ciphertext: [24576]u8,
     write_queue_node: ClientWriteQueue.Node,
     completion: xev.Completion,
