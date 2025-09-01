@@ -22,7 +22,7 @@ pub fn parseAddress(allocator: std.mem.Allocator, payload: []const u8) !net.Addr
             const port = std.mem.readInt(u16, port_bytes[0..2], .big);
 
             const address_list = std.net.getAddressList(allocator, domain, port) catch {
-                std.log.err("TCP failed to resolve domain: {s}", .{domain});
+                std.log.debug("TCP failed to resolve domain: {s}", .{domain});
                 return error.DomainResolutionFailed;
             };
             defer address_list.deinit();

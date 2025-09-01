@@ -52,7 +52,7 @@ fn tcpAcceptCallback(
     const allocator = srv.allocator;
 
     const client_socket = result.accept catch |e| {
-        std.log.err("TCP accept client failed: {}", .{e});
+        std.log.debug("TCP accept client failed: {}", .{e});
         return .disarm;
     };
     const client_address = net.Address.initPosix(@alignCast(&comp.op.accept.addr));
@@ -196,14 +196,6 @@ fn tcpClientReadCallback(
                 .callback = tcpTargetReadCallback,
                 .userdata = tcp_target_read_data,
             },
-            .cancel_completion = .{
-                .op = .{
-                    .shutdown = .{
-                        .how = .both,
-                        .socket = relay.target_socket,
-                    },
-                },
-            },
         };
         loop.add(&tcp_target_read_data.completion);
     }
@@ -271,7 +263,7 @@ fn tcpTargetReadCallback(
     const data = @as(*TargetReadData, @ptrCast(@alignCast(ud.?)));
     const srv = data.server;
     const allocator = srv.allocator;
-    
+
     const relay_opt = srv.tcp_relays.get(data.client_socket);
     if (relay_opt == null) {
         std.debug.print("TCP relay not found in target read callback\n", .{});

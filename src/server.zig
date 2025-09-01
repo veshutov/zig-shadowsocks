@@ -35,11 +35,13 @@ pub const Server = struct {
         try self.tcp_relays.put(relay.client_socket, relay);
     }
 
-    pub fn removeTcpRelay(self: *Server, socket: posix.socket_t, loop: *xev.Loop) void {
-        const relay_entry = self.tcp_relays.fetchRemove(socket);
-        if (relay_entry) |relay| {
-            relay.value.deinit(loop);
-            self.allocator.destroy(relay.value);
+    pub fn removeTcpRelay(self: *Server, client_socket: posix.socket_t, loop: *xev.Loop) void {
+        const relay_entry_opt = self.tcp_relays.fetchRemove(client_socket);
+        if (relay_entry_opt) |relay_entry| {
+            const relay = relay_entry.value;
+            std.debug.print("TCP deleting relay {}, write queue: {}\n", .{ relay.client_address, relay.client_write_queue.len });
+            relay.deinit(loop);
+            self.allocator.destroy(relay);
         }
     }
 };
@@ -71,6 +73,15 @@ pub const TcpRelay = struct {
     server_stream_state: TcpServerStreamState = TcpServerStreamState.writing_salt,
 
     pub fn deinit(self: *TcpRelay, loop: *xev.Loop) void {
+        var i: usize = 0;
+        // first will be executed and freed in callback
+        while (i < self.client_write_queue.len - 1) {
+            const write_queue_node = self.client_write_queue.pop();
+            const client_write_data = write_queue_node.?.data;
+            self.server.allocator.destroy(client_write_data);
+            i += 1;
+        }
+
         self.disconnectFromTarget(loop);
         self.disconnectFromClient(loop);
     }
@@ -244,7 +255,6 @@ pub const TcpRelay = struct {
         self.disconnectFromTarget(loop);
         if (self.client_writes == 0) {
             self.scheduleShutdown(loop, self.client_socket, .send);
-            std.debug.print("TCP deleting relay {}\n", .{self.client_address});
             self.server.removeTcpRelay(self.client_socket, loop);
         }
     }
@@ -253,7 +263,6 @@ pub const TcpRelay = struct {
         self.client_writes -= 1;
         if (self.target_socket_closed and self.client_writes == 0) {
             self.scheduleShutdown(loop, self.client_socket, .send);
-            std.debug.print("TCP deleting relay {}\n", .{self.client_address});
             self.server.removeTcpRelay(self.client_socket, loop);
         }
     }
@@ -296,31 +305,6 @@ pub const TcpRelay = struct {
         };
         loop.add(close_completion);
     }
-
-    fn shutdownOrCloseCallback(
-        ud: ?*anyopaque,
-        _: *xev.Loop,
-        comp: *xev.Completion,
-        result: xev.Result,
-    ) xev.CallbackAction {
-        const allocator = @as(*std.mem.Allocator, @ptrCast(@alignCast(ud.?)));
-        defer allocator.destroy(comp);
-
-        switch (result) {
-            .close => {
-                result.close catch |e| {
-                    std.debug.print("TCP close failed {}\n", .{e});
-                };
-            },
-            .shutdown => {
-                result.close catch |e| {
-                    std.debug.print("TCP shutdown failed {}\n", .{e});
-                };
-            },
-            else => {},
-        }
-        return .disarm;
-    }
 };
 
 pub const TcpClientStreamState = enum {
@@ -353,7 +337,6 @@ pub const TargetReadData = struct {
     server: *Server,
     client_socket: posix.socket_t,
     completion: xev.Completion,
-    cancel_completion: xev.Completion,
 };
 
 pub const ClientWriteData = struct {
@@ -364,3 +347,28 @@ pub const ClientWriteData = struct {
 };
 
 pub const ClientWriteQueue = std.DoublyLinkedList(*ClientWriteData);
+
+fn shutdownOrCloseCallback(
+    ud: ?*anyopaque,
+    _: *xev.Loop,
+    comp: *xev.Completion,
+    result: xev.Result,
+) xev.CallbackAction {
+    const allocator = @as(*std.mem.Allocator, @ptrCast(@alignCast(ud.?)));
+    defer allocator.destroy(comp);
+
+    switch (result) {
+        .close => {
+            result.close catch |e| {
+                std.debug.print("TCP close failed {}\n", .{e});
+            };
+        },
+        .shutdown => {
+            result.shutdown catch |e| {
+                std.debug.print("TCP shutdown failed {}\n", .{e});
+            };
+        },
+        else => {},
+    }
+    return .disarm;
+}
