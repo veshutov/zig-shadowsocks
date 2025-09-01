@@ -73,9 +73,9 @@ pub const TcpRelay = struct {
     server_stream_state: TcpServerStreamState = TcpServerStreamState.writing_salt,
 
     pub fn deinit(self: *TcpRelay, loop: *xev.Loop) void {
-        var i: usize = 0;
         // first will be executed and freed in callback
-        while (i < self.client_write_queue.len - 1) {
+        var i: usize = 1;
+        while (i < self.client_write_queue.len) {
             const write_queue_node = self.client_write_queue.pop();
             const client_write_data = write_queue_node.?.data;
             self.server.allocator.destroy(client_write_data);
