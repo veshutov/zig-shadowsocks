@@ -2,6 +2,7 @@
 Shadowsocks TCP server implementation using event loop
 
 Not for production use:
+- hardcoded password
 - does not handle partial writes to target website
 - blocking dns resolution
 - blocking connect to target website call
